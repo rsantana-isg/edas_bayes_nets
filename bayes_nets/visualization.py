@@ -19,9 +19,11 @@ def plot_bayesian_network(
     node_color: str = "#4C9BE8",
     edge_color: str = "#333333",
     font_color: str = "white",
-    font_size: int = 10,
+    font_size: int = 14,
     node_size: int = 1200,
     title: Optional[str] = None,
+    node_order: Optional[List[int]] = None,
+    pos: Optional[Dict[int, tuple[float, float]]] = None,
     ax=None,
     **layout_kwargs: Any,
 ):
@@ -48,6 +50,10 @@ def plot_bayesian_network(
         Node size (passed to networkx draw).
     title : str, optional
         Plot title.
+    node_order : list of int, optional
+        Preferred node ordering used for deterministic fallback layouts.
+    pos : dict, optional
+        Explicit node positions to reuse across plots.
     ax : matplotlib Axes, optional
         Existing axes to draw on.  If *None* a new figure is created.
     **layout_kwargs
@@ -87,12 +93,21 @@ def plot_bayesian_network(
         fig = ax.get_figure()
 
     # Choose layout
-    try:
-        from networkx.drawing.nx_agraph import graphviz_layout  # type: ignore
+    if pos is None:
+        if node_order is not None:
+            ordered = [int(v) for v in node_order]
+            if sorted(ordered) != list(range(bn.n_vars)):
+                raise ValueError("node_order must contain every node exactly once")
+            local_kwargs = {"nlist": [ordered], "scale": 1.0}
+            local_kwargs.update(layout_kwargs)
+            pos = nx.shell_layout(G, **local_kwargs)
+        else:
+            try:
+                from networkx.drawing.nx_agraph import graphviz_layout  # type: ignore
 
-        pos = graphviz_layout(G, prog="dot", **layout_kwargs)
-    except (ImportError, Exception):
-        pos = nx.spring_layout(G, seed=42, **layout_kwargs)
+                pos = graphviz_layout(G, prog="dot", **layout_kwargs)
+            except (ImportError, Exception):
+                pos = nx.spring_layout(G, seed=42, **layout_kwargs)
 
     nx.draw_networkx(
         G,
