@@ -13,6 +13,9 @@ from bayes_nets import (
     GreedyHillClimbLearner,
     MLEParameterLearner,
     ProbabilisticLogicSampler,
+    moralize,
+    triangulate,
+    junction_tree,
 )
 
 
@@ -154,6 +157,27 @@ class TestScoring:
         score = k2.score(adj_with_edges, simple_data, binary_cardinality)
         assert np.isfinite(score)
 
+    def test_bic_and_aic_handle_zero_counts_without_nan(self):
+        data = np.array(
+            [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [1, 1],
+                [1, 1],
+            ],
+            dtype=int,
+        )
+        cardinality = np.array([3, 2], dtype=int)
+
+        bic = BICScoringMethod(alpha=0.0)
+        aic = AICScoringMethod(alpha=0.0)
+
+        bic_score = bic.local_score(0, [], data, cardinality)
+        aic_score = aic.local_score(0, [], data, cardinality)
+        assert np.isfinite(bic_score)
+        assert np.isfinite(aic_score)
+
 
 # ---------------------------------------------------------------------------
 # Structure learning
@@ -280,3 +304,100 @@ class TestUtilities:
         # Ensure it's a copy
         adj[0, 0] = 99
         assert bn.adjacency[0, 0] != 99
+
+    def test_structure_helpers_and_dependencies(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="bic", max_parents=2)
+
+        assert bn.big_matrix().shape == (4, 4)
+        assert all(len(edge) == 2 for edge in bn.edge_list())
+
+        run_struct = bn.to_run_structure(generation=3, run=1)
+        assert run_struct["generation"] == 3
+        assert run_struct["run"] == 1
+        np.testing.assert_array_equal(run_struct["adjacency"], bn.adjacency)
+
+        deps = bn.variable_dependencies(simple_data)
+        assert set(["adjacency_matrix", "edges", "score", "mi_matrix"]).issubset(deps.keys())
+        assert deps["mi_matrix"].shape == (4, 4)
+        assert np.isfinite(deps["score"])
+
+
+class TestFactorization:
+    def test_moralize_adds_co_parent_edge(self):
+        adj = np.zeros((3, 3), dtype=int)
+        adj[0, 2] = 1
+        adj[1, 2] = 1
+        moral = moralize(adj)
+        assert moral[0, 1] == 1
+        assert moral[1, 0] == 1
+
+    def test_triangulate_and_junction_tree(self):
+        graph = np.array(
+            [
+                [0, 1, 0, 1],
+                [1, 0, 1, 0],
+                [0, 1, 0, 1],
+                [1, 0, 1, 0],
+            ],
+            dtype=int,
+        )
+        triangulated, order, cliques = triangulate(graph, np.array([2, 2, 2, 2]))
+        assert triangulated.shape == (4, 4)
+        assert len(order) == 4
+        assert len(cliques) > 0
+
+        edges, separators = junction_tree(cliques)
+        assert len(edges) == max(len(cliques) - 1, 0)
+        assert len(separators) == len(edges)
+
+    def test_to_factorization_normalizes_tables(self):
+        data = np.array(
+            [
+                [0, 0, 0],
+                [0, 0, 1],
+                [1, 1, 1],
+                [1, 1, 0],
+                [1, 1, 1],
+            ],
+            dtype=int,
+        )
+        bn = BayesianNetwork(n_vars=3, cardinality=np.array([2, 2, 2]))
+        bn.fit(data, method="k2", ordering=np.arange(3), alpha=0.1)
+
+        fact = bn.to_factorization(data=data, alpha=0.1, max_clique_width=2)
+        assert fact.structure.shape[0] == len(fact.tables)
+
+        for row, table in zip(fact.structure, fact.tables):
+            n_overlap = int(row[0])
+            if n_overlap == 0:
+                np.testing.assert_allclose(np.sum(table), 1.0, atol=1e-9)
+            else:
+                np.testing.assert_allclose(np.sum(table, axis=1), 1.0, atol=1e-9)
+
+
+class TestInference:
+    def test_mpc_matches_bruteforce(self):
+        bn = BayesianNetwork(n_vars=2, cardinality=np.array([2, 2]))
+        bn.adjacency[0, 1] = 1
+        bn.cpds = {
+            0: {"parents": [], "cpd": np.array([0.8, 0.2])},
+            1: {"parents": [0], "cpd": np.array([[0.9, 0.1], [0.2, 0.8]])},
+        }
+
+        conf, prob = bn.most_probable_config()
+        np.testing.assert_array_equal(conf, np.array([0, 0]))
+        assert prob == pytest.approx(0.72)
+
+    def test_top_k_configs_sorted(self):
+        bn = BayesianNetwork(n_vars=2, cardinality=np.array([2, 2]))
+        bn.adjacency[0, 1] = 1
+        bn.cpds = {
+            0: {"parents": [], "cpd": np.array([0.8, 0.2])},
+            1: {"parents": [0], "cpd": np.array([[0.9, 0.1], [0.2, 0.8]])},
+        }
+
+        configs, probs = bn.k_most_probable_configs(3)
+        assert configs.shape == (3, 2)
+        assert probs.shape == (3,)
+        assert np.all(probs[:-1] >= probs[1:])

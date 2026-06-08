@@ -21,7 +21,7 @@ Typical workflow
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import numpy as np
 
 
@@ -299,6 +299,23 @@ class BayesianNetwork:
         """Return a copy of the adjacency matrix."""
         return self.adjacency.copy()
 
+    def big_matrix(self) -> np.ndarray:
+        """Alias for the adjacency matrix used by visualization pipelines."""
+        return self.to_adjacency_matrix()
+
+    def edge_list(self) -> List[tuple[int, int]]:
+        """Return directed edges as (parent, child) tuples."""
+        edges = np.argwhere(self.adjacency > 0)
+        return [(int(parent), int(child)) for parent, child in edges]
+
+    def to_run_structure(self, generation: int, run: int = 0) -> Dict:
+        """Return a run-structure entry compatible with EDA visualizers."""
+        return {
+            "adjacency": self.big_matrix(),
+            "generation": int(generation),
+            "run": int(run),
+        }
+
     def set_structure(self, adjacency: np.ndarray) -> "BayesianNetwork":
         """Set the graph structure from an adjacency matrix.
 
@@ -345,6 +362,110 @@ class BayesianNetwork:
         k = int(self.cardinality[var])
         counts = np.bincount(data[:, var], minlength=k).astype(float)
         return counts / counts.sum()
+
+    def structure_score(self, data: np.ndarray, score: str = "bic", alpha: float = 0.0) -> float:
+        """Score the current structure on data using BIC/AIC/K2."""
+        from bayes_nets.scoring import BICScoringMethod, AICScoringMethod, K2ScoringMethod
+
+        method = score.lower()
+        if method == "bic":
+            scorer = BICScoringMethod(alpha=alpha)
+        elif method == "aic":
+            scorer = AICScoringMethod(alpha=alpha)
+        elif method == "k2":
+            scorer = K2ScoringMethod(alpha=max(alpha, 1e-12))
+        else:
+            raise ValueError("score must be 'bic', 'aic', or 'k2'")
+        return float(scorer.score(self.adjacency, np.asarray(data, dtype=int), self.cardinality))
+
+    def markov_blanket(self, var: int) -> List[int]:
+        """Return Markov blanket: parents, children, and children's other parents."""
+        parents = set(self.get_parents(var))
+        children = set(self.get_children(var))
+        spouses: set[int] = set()
+        for child in children:
+            spouses.update(self.get_parents(child))
+        spouses.discard(var)
+        blanket = sorted(parents.union(children).union(spouses))
+        return [int(v) for v in blanket]
+
+    def variable_dependencies(self, data: np.ndarray, score: str = "bic", alpha: float = 0.0) -> Dict:
+        """Return dependency analysis summary compatible with EDA consumers."""
+        data = np.asarray(data, dtype=int)
+        n_vars = data.shape[1]
+        mi = np.zeros((n_vars, n_vars), dtype=float)
+
+        for i in range(n_vars):
+            xi = data[:, i]
+            card_i = int(self.cardinality[i])
+            p_i = np.bincount(xi, minlength=card_i).astype(float)
+            p_i /= p_i.sum()
+            for j in range(i + 1, n_vars):
+                xj = data[:, j]
+                card_j = int(self.cardinality[j])
+
+                pair_idx = xi + card_i * xj
+                p_ij = np.bincount(pair_idx, minlength=card_i * card_j).astype(float)
+                p_ij = p_ij.reshape(card_j, card_i).T
+                p_ij /= p_ij.sum()
+
+                p_j = np.bincount(xj, minlength=card_j).astype(float)
+                p_j /= p_j.sum()
+
+                val = 0.0
+                for ai in range(card_i):
+                    for aj in range(card_j):
+                        if p_ij[ai, aj] > 0 and p_i[ai] > 0 and p_j[aj] > 0:
+                            val += p_ij[ai, aj] * np.log2(p_ij[ai, aj] / (p_i[ai] * p_j[aj]))
+                mi[i, j] = val
+                mi[j, i] = val
+
+        return {
+            "adjacency_matrix": self.big_matrix(),
+            "edges": self.edge_list(),
+            "score": self.structure_score(data, score=score, alpha=alpha),
+            "mi_matrix": mi,
+            "parents": {var: self.get_parents(var) for var in range(self.n_vars)},
+            "markov_blankets": {var: self.markov_blanket(var) for var in range(self.n_vars)},
+            "degree": {
+                var: int(self.adjacency[var, :].sum() + self.adjacency[:, var].sum())
+                for var in range(self.n_vars)
+            },
+        }
+
+    def to_factorization(
+        self,
+        data: Optional[np.ndarray] = None,
+        alpha: float = 1.0,
+        max_clique_width: Optional[int] = None,
+        width_control: str = "split",
+        triangulation_method: str = "min-fill",
+    ):
+        """Convert the BN into a clique factorization for FDA-style sampling."""
+        from bayes_nets.factorization import bn_to_factorization
+
+        return bn_to_factorization(
+            adjacency=self.adjacency,
+            cardinality=self.cardinality,
+            cpds=self.cpds,
+            data=data,
+            alpha=alpha,
+            max_clique_width=max_clique_width,
+            width_control=width_control,
+            triangulation_method=triangulation_method,
+        )
+
+    def most_probable_config(self, evidence: Optional[Dict[int, int]] = None):
+        """Return the most probable assignment and its probability."""
+        from bayes_nets.inference import MaxProductInference
+
+        return MaxProductInference(self).most_probable_config(evidence=evidence)
+
+    def k_most_probable_configs(self, k: int, evidence: Optional[Dict[int, int]] = None):
+        """Return top-k assignments sorted by decreasing probability."""
+        from bayes_nets.inference import MaxProductInference
+
+        return MaxProductInference(self).k_most_probable_configs(k=k, evidence=evidence)
 
     # ------------------------------------------------------------------
     # Representation

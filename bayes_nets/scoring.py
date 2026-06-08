@@ -106,7 +106,8 @@ def _log_likelihood(
     if not parents:
         counts = np.bincount(data[:, var], minlength=k).astype(float) + alpha
         total = counts.sum()
-        ll = np.sum(counts * np.log(counts / total))
+        nz = counts > 0
+        ll = np.sum(counts[nz] * np.log(counts[nz] / total))
         return float(ll)
 
     parent_card = [int(cardinality[p]) for p in parents]
@@ -123,7 +124,8 @@ def _log_likelihood(
             continue
         counts = np.bincount(data[mask, var], minlength=k).astype(float) + alpha
         total = counts.sum()
-        ll += np.sum(counts * np.log(counts / total))
+        nz = counts > 0
+        ll += np.sum(counts[nz] * np.log(counts[nz] / total))
 
     return float(ll)
 

@@ -11,6 +11,13 @@ from bayes_nets.scoring import BICScoringMethod, AICScoringMethod, K2ScoringMeth
 from bayes_nets.structure_learning import K2StructureLearner, GreedyHillClimbLearner
 from bayes_nets.parameter_learning import MLEParameterLearner
 from bayes_nets.sampling import ProbabilisticLogicSampler
+from bayes_nets.factorization import (
+    CliqueFactorization,
+    moralize,
+    triangulate,
+    junction_tree,
+)
+from bayes_nets.inference import MaxProductInference
 
 __all__ = [
     "BayesianNetwork",
@@ -21,6 +28,11 @@ __all__ = [
     "GreedyHillClimbLearner",
     "MLEParameterLearner",
     "ProbabilisticLogicSampler",
+    "CliqueFactorization",
+    "moralize",
+    "triangulate",
+    "junction_tree",
+    "MaxProductInference",
 ]
 
 __version__ = "0.1.0"
