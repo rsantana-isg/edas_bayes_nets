@@ -1,0 +1,282 @@
+"""
+Tests for the bayes_nets library.
+"""
+
+import numpy as np
+import pytest
+from bayes_nets import (
+    BayesianNetwork,
+    BICScoringMethod,
+    AICScoringMethod,
+    K2ScoringMethod,
+    K2StructureLearner,
+    GreedyHillClimbLearner,
+    MLEParameterLearner,
+    ProbabilisticLogicSampler,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def simple_data():
+    """Data with strong dependencies: X0 → X1 → X2, X0 → X3.
+
+    Each child is its parent with 10 % random flip noise, so the
+    dependency signal is clear.
+    """
+    rng = np.random.default_rng(42)
+    n = 1000
+    X0 = rng.integers(0, 2, size=n)
+    # flip parent value with probability 0.1
+    X1 = np.where(rng.random(n) < 0.1, 1 - X0, X0)
+    X2 = np.where(rng.random(n) < 0.1, 1 - X1, X1)
+    X3 = np.where(rng.random(n) < 0.1, 1 - X0, X0)
+    return np.column_stack([X0, X1, X2, X3])
+
+
+@pytest.fixture
+def binary_cardinality():
+    return np.full(4, 2)
+
+
+# ---------------------------------------------------------------------------
+# BayesianNetwork construction
+# ---------------------------------------------------------------------------
+
+class TestBayesianNetworkConstruction:
+    def test_valid_construction(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 3, 2])
+        assert bn.n_vars == 3
+        assert list(bn.cardinality) == [2, 3, 2]
+        assert bn.adjacency.shape == (3, 3)
+
+    def test_invalid_n_vars(self):
+        with pytest.raises(ValueError):
+            BayesianNetwork(n_vars=0, cardinality=[])
+
+    def test_invalid_cardinality_length(self):
+        with pytest.raises(ValueError):
+            BayesianNetwork(n_vars=3, cardinality=[2, 2])
+
+    def test_invalid_cardinality_value(self):
+        with pytest.raises(ValueError):
+            BayesianNetwork(n_vars=2, cardinality=[1, 2])
+
+
+# ---------------------------------------------------------------------------
+# Graph manipulation
+# ---------------------------------------------------------------------------
+
+class TestGraphManipulation:
+    def test_add_edge(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        bn.add_edge(0, 1)
+        assert bn.has_edge(0, 1)
+        assert not bn.has_edge(1, 0)
+
+    def test_add_self_loop_raises(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        with pytest.raises(ValueError):
+            bn.add_edge(1, 1)
+
+    def test_add_cycle_raises(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        bn.add_edge(0, 1)
+        bn.add_edge(1, 2)
+        with pytest.raises(ValueError):
+            bn.add_edge(2, 0)
+
+    def test_remove_edge(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        bn.add_edge(0, 1)
+        bn.remove_edge(0, 1)
+        assert not bn.has_edge(0, 1)
+
+    def test_get_parents(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        bn.add_edge(0, 2)
+        bn.add_edge(1, 2)
+        assert sorted(bn.get_parents(2)) == [0, 1]
+
+    def test_get_children(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        bn.add_edge(0, 1)
+        bn.add_edge(0, 2)
+        assert sorted(bn.get_children(0)) == [1, 2]
+
+    def test_is_dag(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        bn.add_edge(0, 1)
+        assert bn.is_dag()
+
+    def test_topological_order(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        bn.add_edge(0, 2)
+        bn.add_edge(1, 2)
+        order = bn.topological_order()
+        # 2 must come after both 0 and 1
+        assert list(order).index(2) > list(order).index(0)
+        assert list(order).index(2) > list(order).index(1)
+
+
+# ---------------------------------------------------------------------------
+# Scoring metrics
+# ---------------------------------------------------------------------------
+
+class TestScoring:
+    def test_bic_no_parents_vs_with_parents(self, simple_data, binary_cardinality):
+        bic = BICScoringMethod(alpha=0.0)
+        score_no_parent = bic.local_score(1, [], simple_data, binary_cardinality)
+        score_with_parent = bic.local_score(1, [0], simple_data, binary_cardinality)
+        # X1 depends on X0; adding X0 as parent should improve BIC
+        assert score_with_parent > score_no_parent
+
+    def test_aic_no_parents_vs_with_parents(self, simple_data, binary_cardinality):
+        aic = AICScoringMethod(alpha=0.0)
+        score_no_parent = aic.local_score(1, [], simple_data, binary_cardinality)
+        score_with_parent = aic.local_score(1, [0], simple_data, binary_cardinality)
+        assert score_with_parent > score_no_parent
+
+    def test_k2_score_improves_with_true_parent(self, simple_data, binary_cardinality):
+        k2 = K2ScoringMethod(alpha=1.0)
+        score_no_parent = k2.local_score(1, [], simple_data, binary_cardinality)
+        score_with_parent = k2.local_score(1, [0], simple_data, binary_cardinality)
+        assert score_with_parent > score_no_parent
+
+    def test_k2_total_score(self, simple_data, binary_cardinality):
+        k2 = K2ScoringMethod()
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        adj_with_edges = bn.adjacency.copy()
+        adj_with_edges[0, 1] = 1
+        score = k2.score(adj_with_edges, simple_data, binary_cardinality)
+        assert np.isfinite(score)
+
+
+# ---------------------------------------------------------------------------
+# Structure learning
+# ---------------------------------------------------------------------------
+
+class TestStructureLearning:
+    def test_k2_recovers_structure(self, simple_data, binary_cardinality):
+        learner = K2StructureLearner(max_parents=2, alpha=1.0)
+        ordering = np.array([0, 1, 3, 2])
+        adj = learner.learn(simple_data, 4, binary_cardinality, ordering)
+        # X0 → X1, X1 → X2, X0 → X3
+        assert adj[0, 1] == 1
+        assert adj[1, 2] == 1
+        assert adj[0, 3] == 1
+
+    def test_greedy_bic_finds_dependencies(self, simple_data, binary_cardinality):
+        scoring = BICScoringMethod()
+        learner = GreedyHillClimbLearner(scoring=scoring, max_parents=2)
+        adj = learner.learn(simple_data, 4, binary_cardinality)
+        # The learned graph should have at least some edges
+        assert adj.sum() > 0
+
+    def test_fit_bic(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="bic", max_parents=2)
+        assert bn.is_dag()
+        assert bn.cpds
+
+    def test_fit_k2(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="k2", max_parents=2, ordering=np.arange(4))
+        assert bn.is_dag()
+        assert bn.cpds
+
+    def test_unknown_method_raises(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        with pytest.raises(ValueError):
+            bn.fit(simple_data, method="unknown")
+
+
+# ---------------------------------------------------------------------------
+# Parameter learning
+# ---------------------------------------------------------------------------
+
+class TestParameterLearning:
+    def test_marginal_sums_to_one(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="k2", ordering=np.arange(4))
+        for var in range(4):
+            cpd = bn.cpds[var]["cpd"]
+            if cpd.ndim == 1:
+                assert abs(cpd.sum() - 1.0) < 1e-9
+            else:
+                np.testing.assert_allclose(cpd.sum(axis=1), 1.0, atol=1e-9)
+
+    def test_cpd_shapes(self, simple_data, binary_cardinality):
+        learner = MLEParameterLearner(alpha=1.0)
+        adj = np.zeros((4, 4), dtype=int)
+        adj[0, 1] = 1  # X0 → X1
+        cpds = learner.learn(simple_data, 4, binary_cardinality, adj)
+        assert cpds[0]["cpd"].shape == (2,)     # root, cardinality 2
+        assert cpds[1]["cpd"].shape == (2, 2)   # 1 parent (card 2), child card 2
+
+
+# ---------------------------------------------------------------------------
+# Sampling
+# ---------------------------------------------------------------------------
+
+class TestSampling:
+    def test_sample_shape(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="bic")
+        samples = bn.sample(100, rng=np.random.default_rng(0))
+        assert samples.shape == (100, 4)
+
+    def test_sample_values_in_range(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="bic")
+        samples = bn.sample(200)
+        for var in range(4):
+            assert samples[:, var].min() >= 0
+            assert samples[:, var].max() < binary_cardinality[var]
+
+    def test_sample_without_cpds_raises(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        with pytest.raises(RuntimeError):
+            bn.sample(10)
+
+    def test_sample_reproducibility(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="bic")
+        s1 = bn.sample(50, rng=np.random.default_rng(99))
+        s2 = bn.sample(50, rng=np.random.default_rng(99))
+        np.testing.assert_array_equal(s1, s2)
+
+
+# ---------------------------------------------------------------------------
+# repr / utility methods
+# ---------------------------------------------------------------------------
+
+class TestUtilities:
+    def test_repr(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        r = repr(bn)
+        assert "BayesianNetwork" in r
+        assert "n_vars=3" in r
+
+    def test_n_parameters(self):
+        bn = BayesianNetwork(n_vars=3, cardinality=[2, 2, 2])
+        # No edges: 3 variables, each with 1 free parameter
+        assert bn.n_parameters() == 3
+
+    def test_marginal(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        m = bn.marginal(0, simple_data)
+        assert m.shape == (2,)
+        assert abs(m.sum() - 1.0) < 1e-9
+
+    def test_to_adjacency_matrix(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="bic")
+        adj = bn.to_adjacency_matrix()
+        np.testing.assert_array_equal(adj, bn.adjacency)
+        # Ensure it's a copy
+        adj[0, 0] = 99
+        assert bn.adjacency[0, 0] != 99

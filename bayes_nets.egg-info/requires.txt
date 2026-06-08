@@ -1,0 +1,9 @@
+numpy
+scipy
+
+[dev]
+pytest
+
+[viz]
+matplotlib
+networkx
