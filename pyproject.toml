@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bayes_nets"
 version = "0.1.0"
-description = "Discrete Bayesian network learning, sampling, and visualisation"
+description = "Discrete Bayesian network learning, sampling, and visualization"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [

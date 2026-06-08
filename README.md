@@ -1,6 +1,6 @@
 # bayes_nets
 
-A lightweight, standalone Python library for **learning**, **sampling**, and **visualising** discrete Bayesian networks (BNs).
+A lightweight, standalone Python library for **learning**, **sampling**, and **visualizing** discrete Bayesian networks (BNs).
 
 Designed as a drop-in replacement for [pgmpy](https://pgmpy.org/) within estimation-of-distribution algorithm (EDA) workflows, while remaining fully usable as a general-purpose BN toolkit.
 
@@ -12,7 +12,7 @@ Designed as a drop-in replacement for [pgmpy](https://pgmpy.org/) within estimat
 * **Multiple structure-learning algorithms** – BIC, AIC, and K2 scoring with greedy hill-climbing or the K2 algorithm.
 * **Probabilistic logic sampling** – forward (ancestral) sampling from a learned BN.
 * **EDA integration** – the library is designed to work seamlessly with the `eda_code` learning and sampling modules as a replacement for pgmpy.
-* **Visualisation** – plot BN structures and marginal/conditional probability distributions.
+* **Visualization** – plot BN structures and marginal/conditional probability distributions.
 
 ---
 
@@ -32,7 +32,7 @@ pip install -e .
 | `numpy` | Numerical computation |
 | `scipy` | `gammaln` for K2 scoring |
 
-**Optional dependencies** (needed for visualisation)
+**Optional dependencies** (needed for visualization)
 
 | Package | Purpose |
 |---------|---------|

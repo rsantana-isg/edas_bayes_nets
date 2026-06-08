@@ -1,5 +1,5 @@
 """
-Visualisation utilities for Bayesian networks.
+Visualization utilities for Bayesian networks.
 
 Requires matplotlib and networkx (optional dependencies).
 """
@@ -30,7 +30,7 @@ def plot_bayesian_network(
     Parameters
     ----------
     bn : BayesianNetwork
-        The Bayesian network to visualise.
+        The Bayesian network to visualize.
     node_labels : list of str, optional
         Human-readable labels for each variable.  Defaults to
         ``["X0", "X1", ...]``.
@@ -64,7 +64,7 @@ def plot_bayesian_network(
         import networkx as nx
     except ImportError as exc:
         raise ImportError(
-            "matplotlib and networkx are required for visualisation. "
+            "matplotlib and networkx are required for visualization. "
             "Install them with: pip install matplotlib networkx"
         ) from exc
 
@@ -144,7 +144,7 @@ def plot_marginals(
         import matplotlib.pyplot as plt
         import numpy as np
     except ImportError as exc:
-        raise ImportError("matplotlib is required for visualisation.") from exc
+        raise ImportError("matplotlib is required for visualization.") from exc
 
     if not bn.cpds:
         raise RuntimeError("CPDs have not been learned yet.")
