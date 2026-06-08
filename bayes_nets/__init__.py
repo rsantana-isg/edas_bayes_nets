@@ -8,7 +8,12 @@ but fully usable as a standalone library.
 
 from bayes_nets.bayesian_network import BayesianNetwork
 from bayes_nets.scoring import BICScoringMethod, AICScoringMethod, K2ScoringMethod
-from bayes_nets.structure_learning import K2StructureLearner, GreedyHillClimbLearner
+from bayes_nets.structure_learning import (
+    K2StructureLearner,
+    GreedyHillClimbLearner,
+    StableHillClimbLearner,
+    TabuHillClimbLearner,
+)
 from bayes_nets.parameter_learning import MLEParameterLearner
 from bayes_nets.sampling import ProbabilisticLogicSampler
 from bayes_nets.factorization import (
@@ -26,6 +31,8 @@ __all__ = [
     "K2ScoringMethod",
     "K2StructureLearner",
     "GreedyHillClimbLearner",
+    "StableHillClimbLearner",
+    "TabuHillClimbLearner",
     "MLEParameterLearner",
     "ProbabilisticLogicSampler",
     "CliqueFactorization",

@@ -1,18 +1,55 @@
 """
 Structure learning algorithms for Bayesian networks.
 
+All learners accept four common optional parameters in their ``learn()``
+method (described in detail below):
+
+- ``permutation``      – variable ordering that restricts parent search
+- ``interaction_matrix`` – symmetric binary matrix of allowed interactions
+- ``max_parents``      – maximum parents per variable (rule-of-thumb if None)
+- ``sample_weights``   – probability vector over data rows
+
 K2StructureLearner
     Greedy search using a fixed variable ordering (Cooper & Herskovits 1992).
-    Guarantees acyclicity via the ordering constraint.
 
 GreedyHillClimbLearner
-    Unconstrained greedy hill-climbing with explicit cycle detection.
-    Suitable for BIC/AIC scoring where no ordering is required.
+    Greedy add-only hill-climbing with explicit cycle detection.
+
+StableHillClimbLearner
+    HC over add / delete / reverse with deterministic tie-breaking
+    (HC-Stable, Kitson & Constantinou 2023).
+
+TabuHillClimbLearner
+    HC-Stable extended with a tabu list (Kitson & Constantinou 2023).
+
+Common parameters
+-----------------
+permutation : array-like of int, optional
+    A permutation σ of [0 … n_vars-1].  Parents of σ(j) are restricted to
+    {σ(i) : i < j}.  This guarantees acyclicity for the ADD operation and
+    makes explicit cycle detection unnecessary.  When ``None`` (default)
+    no ordering constraint is imposed and cycle detection is used as before.
+    Reversal operations are skipped whenever the permutation constraint would
+    prevent the reversed edge (including all permutation-constrained cases).
+
+interaction_matrix : np.ndarray of shape (n_vars, n_vars), optional
+    Symmetric binary matrix.  An edge u → v is considered only when
+    ``interaction_matrix[u, v] == 1``.  ``None`` means all pairs are
+    allowed (equivalent to an all-ones matrix).
+
+max_parents : int or None
+    Maximum parents per variable.  When ``None``, a rule of thumb is used:
+    ``max(1, floor(10 · log(2) / log(max_cardinality)))``.
+    For all-binary variables this gives 10; higher cardinalities reduce it.
+
+sample_weights : array of float, shape (n_samples,), optional
+    Probability distribution over rows (must sum to 1).  Used to compute
+    weighted counts for the scoring function.  ``None`` uses uniform 1/N.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -20,7 +57,7 @@ from bayes_nets.scoring import ScoringMethod, K2ScoringMethod
 
 
 # ---------------------------------------------------------------------------
-# Shared utility
+# Shared utilities
 # ---------------------------------------------------------------------------
 
 
@@ -50,6 +87,61 @@ def _would_create_cycle(adjacency: np.ndarray, parent: int, child: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Common-parameter helpers
+# ---------------------------------------------------------------------------
+
+
+def _default_max_parents(cardinality: np.ndarray) -> int:
+    """Rule-of-thumb: keep table sizes comparable to binary with mP=10.
+
+    Returns ``max(1, floor(10 · log2 / log(k_max)))`` where k_max is the
+    maximum cardinality.  Examples: k=2 → 10, k=3 → 6, k=4 → 5, k=10 → 3.
+    """
+    k_max = max(2, int(np.max(cardinality)))
+    return max(1, int(10 * np.log(2) / np.log(k_max)))
+
+
+def _compute_perm_pos(n_vars: int, permutation: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Return position-in-permutation for each variable index.
+
+    ``perm_pos[v]`` = j such that permutation[j] = v.
+    Returns ``None`` when ``permutation`` is None (no constraint).
+    """
+    if permutation is None:
+        return None
+    perm_pos = np.empty(n_vars, dtype=int)
+    for j, v in enumerate(permutation):
+        perm_pos[int(v)] = j
+    return perm_pos
+
+
+def _build_allowed_parents(
+    n_vars: int,
+    perm_pos: Optional[np.ndarray],
+    interaction_matrix: Optional[np.ndarray],
+) -> Dict[int, List[int]]:
+    """Compute the set of allowed parents for every variable.
+
+    An edge u → v is allowed when:
+    1. permutation constraint: perm_pos[u] < perm_pos[v]  (or no constraint)
+    2. interaction constraint: interaction_matrix[u, v] == 1  (or no matrix)
+    """
+    allowed: Dict[int, List[int]] = {}
+    for v in range(n_vars):
+        parents = []
+        for u in range(n_vars):
+            if u == v:
+                continue
+            if perm_pos is not None and perm_pos[u] >= perm_pos[v]:
+                continue
+            if interaction_matrix is not None and interaction_matrix[u, v] == 0:
+                continue
+            parents.append(u)
+        allowed[v] = parents
+    return allowed
+
+
+# ---------------------------------------------------------------------------
 # K2 algorithm
 # ---------------------------------------------------------------------------
 
@@ -57,14 +149,12 @@ def _would_create_cycle(adjacency: np.ndarray, parent: int, child: int) -> bool:
 class K2StructureLearner:
     """Learn a BN structure using the K2 algorithm.
 
-    The K2 algorithm (Cooper & Herskovits, 1992) requires a *fixed variable
-    ordering* and greedily adds parents to each variable (respecting the
-    ordering) as long as the score improves.
+    Greedy search over a fixed variable ordering (Cooper & Herskovits 1992).
 
     Parameters
     ----------
-    max_parents : int
-        Maximum number of parents per variable.
+    max_parents : int or None
+        Maximum parents per variable.  ``None`` → rule of thumb.
     alpha : float
         Prior equivalent sample size for the K2 score.
     limit_table_size : bool
@@ -74,21 +164,24 @@ class K2StructureLearner:
 
     def __init__(
         self,
-        max_parents: int = 3,
+        max_parents: Optional[int] = None,
         alpha: float = 1.0,
         limit_table_size: bool = True,
     ) -> None:
         self.max_parents = max_parents
         self.alpha = alpha
         self.limit_table_size = limit_table_size
-        self._scoring = K2ScoringMethod(alpha=alpha)
 
     def learn(
         self,
         data: np.ndarray,
         n_vars: int,
         cardinality: np.ndarray,
-        ordering: np.ndarray,
+        ordering: Optional[np.ndarray] = None,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Return adjacency matrix learned from *data*.
 
@@ -97,43 +190,57 @@ class K2StructureLearner:
         data : np.ndarray, shape (n_samples, n_vars)
         n_vars : int
         cardinality : np.ndarray, shape (n_vars,)
-        ordering : np.ndarray
-            Variable ordering – each variable may only have parents that
-            appear *earlier* in this ordering.
+        ordering : array-like of int, optional
+            Legacy positional argument; use ``permutation`` instead.
+            If both are given, ``permutation`` takes precedence.
+        permutation : array-like of int, optional
+            Variable ordering σ.  Defaults to [0, 1, ..., n_vars-1].
+        interaction_matrix : np.ndarray, optional
+        sample_weights : array of float, optional
 
         Returns
         -------
         np.ndarray, shape (n_vars, n_vars)
-            Adjacency matrix (``adj[i, j] == 1`` ⟺ i → j).
         """
         n_samples = data.shape[0]
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+
+        # Resolve ordering: permutation > ordering > natural
+        if permutation is not None:
+            eff_order = np.asarray(permutation, dtype=int)
+        elif ordering is not None:
+            eff_order = np.asarray(ordering, dtype=int)
+        else:
+            eff_order = np.arange(n_vars, dtype=int)
+
+        scoring = K2ScoringMethod(alpha=self.alpha, sample_weights=sample_weights)
         adjacency = np.zeros((n_vars, n_vars), dtype=int)
 
-        for pos, var in enumerate(ordering):
-            possible_parents: List[int] = list(ordering[:pos])
+        for pos, var in enumerate(eff_order):
+            # Candidate parents: earlier in ordering AND allowed by interaction_matrix
+            possible: List[int] = [
+                int(eff_order[i]) for i in range(pos)
+                if interaction_matrix is None or interaction_matrix[int(eff_order[i]), int(var)] != 0
+            ]
             current_parents: List[int] = []
-            current_score = self._scoring.local_score(
-                var, current_parents, data, cardinality
-            )
+            current_score = scoring.local_score(var, current_parents, data, cardinality)
 
             improved = True
-            while improved and len(current_parents) < self.max_parents:
+            while improved and len(current_parents) < mp:
                 improved = False
                 best_parent = -1
                 best_score = current_score
 
-                for candidate in possible_parents:
+                for candidate in possible:
                     if candidate in current_parents:
                         continue
                     test_parents = current_parents + [candidate]
                     if self.limit_table_size:
                         if _joint_table_size(cardinality, [var] + test_parents) > n_samples:
                             continue
-                    score = self._scoring.local_score(
-                        var, test_parents, data, cardinality
-                    )
-                    if score > best_score:
-                        best_score = score
+                    s = scoring.local_score(var, test_parents, data, cardinality)
+                    if s > best_score:
+                        best_score = s
                         best_parent = candidate
                         improved = True
 
@@ -148,33 +255,27 @@ class K2StructureLearner:
 
 
 # ---------------------------------------------------------------------------
-# Greedy hill-climbing
+# Greedy hill-climbing (add-only)
 # ---------------------------------------------------------------------------
 
 
 class GreedyHillClimbLearner:
-    """Learn a BN structure using greedy hill-climbing.
+    """Learn a BN structure using greedy add-only hill-climbing.
 
-    For each variable the algorithm greedily adds parents while the
-    chosen scoring metric improves, detecting cycles explicitly so that
-    no variable ordering is required.
+    Considers adding one parent at a time per variable, using cycle
+    detection when no permutation is given.
 
     Parameters
     ----------
     scoring : ScoringMethod
-        An instance of :class:`~bayes_nets.scoring.ScoringMethod`
-        (e.g. :class:`~bayes_nets.scoring.BICScoringMethod`).
-    max_parents : int
-        Maximum number of parents per variable.
+    max_parents : int or None
     limit_table_size : bool
-        Skip candidate parent sets whose joint table would exceed the
-        number of training samples.
     """
 
     def __init__(
         self,
         scoring: ScoringMethod,
-        max_parents: int = 3,
+        max_parents: Optional[int] = None,
         limit_table_size: bool = True,
     ) -> None:
         self.scoring = scoring
@@ -186,46 +287,43 @@ class GreedyHillClimbLearner:
         data: np.ndarray,
         n_vars: int,
         cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Return adjacency matrix learned from *data*.
-
-        Parameters
-        ----------
-        data : np.ndarray, shape (n_samples, n_vars)
-        n_vars : int
-        cardinality : np.ndarray, shape (n_vars,)
-
-        Returns
-        -------
-        np.ndarray, shape (n_vars, n_vars)
-        """
+        """Return adjacency matrix learned from *data*."""
         n_samples = data.shape[0]
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+
+        perm_pos = _compute_perm_pos(n_vars, permutation)
+        allowed = _build_allowed_parents(n_vars, perm_pos, interaction_matrix)
+        perm_constrained = perm_pos is not None
+
+        scorer = self.scoring if sample_weights is None else self.scoring.with_weights(sample_weights)
+
         adjacency = np.zeros((n_vars, n_vars), dtype=int)
 
         for var in range(n_vars):
             current_parents: List[int] = []
-            current_score = self.scoring.local_score(
-                var, current_parents, data, cardinality
-            )
+            current_score = scorer.local_score(var, current_parents, data, cardinality)
 
-            for _ in range(min(self.max_parents, n_vars - 1)):
+            for _ in range(mp):
                 best_parent = -1
                 best_score = current_score
 
-                for candidate in range(n_vars):
-                    if candidate == var or candidate in current_parents:
+                for candidate in allowed[var]:
+                    if candidate in current_parents:
                         continue
-                    if _would_create_cycle(adjacency, candidate, var):
+                    if not perm_constrained and _would_create_cycle(adjacency, candidate, var):
                         continue
                     test_parents = current_parents + [candidate]
                     if self.limit_table_size:
                         if _joint_table_size(cardinality, [var] + test_parents) > n_samples:
                             continue
-                    score = self.scoring.local_score(
-                        var, test_parents, data, cardinality
-                    )
-                    if score > best_score:
-                        best_score = score
+                    s = scorer.local_score(var, test_parents, data, cardinality)
+                    if s > best_score:
+                        best_score = s
                         best_parent = candidate
 
                 if best_parent >= 0:
@@ -236,3 +334,367 @@ class GreedyHillClimbLearner:
                     break
 
         return adjacency
+
+
+# ---------------------------------------------------------------------------
+# HC-Stable helpers
+# ---------------------------------------------------------------------------
+
+_OP_PRIORITY = {"add": 0, "del": 1, "rev": 2}
+
+
+def _op_key(delta: float, op: str, u: int, v: int) -> tuple:
+    """Comparison key: higher delta wins; ties broken by op type then (u, v)."""
+    return (delta, -_OP_PRIORITY[op], -u, -v)
+
+
+# ---------------------------------------------------------------------------
+# HC-Stable (Kitson & Constantinou 2023)
+# ---------------------------------------------------------------------------
+
+
+class StableHillClimbLearner:
+    """Learn a BN structure via stable greedy hill-climbing.
+
+    Considers add / delete / reverse operations globally in each iteration
+    and breaks score ties deterministically (HC-Stable).  Reversal is
+    skipped when the permutation constraint makes it impossible.
+
+    Parameters
+    ----------
+    scoring : ScoringMethod
+    max_parents : int or None
+    max_iter : int
+    limit_table_size : bool
+    """
+
+    def __init__(
+        self,
+        scoring: ScoringMethod,
+        max_parents: Optional[int] = None,
+        max_iter: int = 500,
+        limit_table_size: bool = True,
+    ) -> None:
+        self.scoring = scoring
+        self.max_parents = max_parents
+        self.max_iter = max_iter
+        self.limit_table_size = limit_table_size
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Return adjacency matrix learned from *data*."""
+        n_samples = data.shape[0]
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+
+        perm_pos = _compute_perm_pos(n_vars, permutation)
+        allowed = _build_allowed_parents(n_vars, perm_pos, interaction_matrix)
+        perm_constrained = perm_pos is not None
+
+        scorer = self.scoring if sample_weights is None else self.scoring.with_weights(sample_weights)
+        cache: dict = {}
+
+        def local(var: int, parents: List[int]) -> float:
+            key = (var, tuple(sorted(parents)))
+            if key not in cache:
+                cache[key] = scorer.local_score(var, list(parents), data, cardinality)
+            return cache[key]
+
+        def parents_of(var: int) -> List[int]:
+            return list(np.where(adjacency[:, var] > 0)[0])
+
+        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+
+        for _ in range(self.max_iter):
+            best_key = None
+            best_op: Optional[tuple] = None
+
+            for u in range(n_vars):
+                for v in range(n_vars):
+                    if u == v:
+                        continue
+
+                    # ADD u → v
+                    if adjacency[u, v] == 0 and adjacency[v, u] == 0 and u in allowed[v]:
+                        pa_v = parents_of(v)
+                        if len(pa_v) < mp:
+                            if perm_constrained or not _would_create_cycle(adjacency, u, v):
+                                new_pa = pa_v + [u]
+                                if not self.limit_table_size or _joint_table_size(cardinality, [v] + new_pa) <= n_samples:
+                                    delta = local(v, new_pa) - local(v, pa_v)
+                                    k = _op_key(delta, "add", u, v)
+                                    if best_key is None or k > best_key:
+                                        best_key, best_op = k, ("add", u, v)
+
+                    # DELETE u → v
+                    if adjacency[u, v] == 1:
+                        pa_v = parents_of(v)
+                        new_pa = [p for p in pa_v if p != u]
+                        delta = local(v, new_pa) - local(v, pa_v)
+                        k = _op_key(delta, "del", u, v)
+                        if best_key is None or k > best_key:
+                            best_key, best_op = k, ("del", u, v)
+
+                    # REVERSE u → v  becomes  v → u
+                    # Only possible if v is an allowed parent of u.
+                    if adjacency[u, v] == 1 and v in allowed[u]:
+                        pa_u = parents_of(u)
+                        pa_v = parents_of(v)
+                        if len(pa_u) < mp:
+                            can_rev: bool
+                            if perm_constrained:
+                                can_rev = True  # ordering already guaranteed by allowed[u]
+                            else:
+                                adjacency[u, v] = 0
+                                can_rev = not _would_create_cycle(adjacency, v, u)
+                                adjacency[u, v] = 1
+                            if can_rev:
+                                new_pa_u = pa_u + [v]
+                                new_pa_v = [p for p in pa_v if p != u]
+                                if not self.limit_table_size or _joint_table_size(cardinality, [u] + new_pa_u) <= n_samples:
+                                    delta = (
+                                        local(v, new_pa_v) + local(u, new_pa_u)
+                                        - local(v, pa_v) - local(u, pa_u)
+                                    )
+                                    k = _op_key(delta, "rev", u, v)
+                                    if best_key is None or k > best_key:
+                                        best_key, best_op = k, ("rev", u, v)
+
+            if best_op is None or best_key[0] <= 0.0:
+                break
+
+            op, u, v = best_op
+            if op == "add":
+                adjacency[u, v] = 1
+            elif op == "del":
+                adjacency[u, v] = 0
+            else:  # rev
+                adjacency[u, v] = 0
+                adjacency[v, u] = 1
+            for key in [k for k in cache if k[0] in (u, v)]:
+                cache.pop(key, None)
+
+        return adjacency
+
+
+# ---------------------------------------------------------------------------
+# Tabu-Stable (Kitson & Constantinou 2023)
+# ---------------------------------------------------------------------------
+
+
+class TabuHillClimbLearner:
+    """Learn a BN structure via Tabu-stable hill-climbing.
+
+    Extends HC-Stable with a tabu list to escape local optima.  An
+    aspiration criterion overrides tabu status when the move strictly
+    improves the global best score.
+
+    Parameters
+    ----------
+    scoring : ScoringMethod
+    max_parents : int or None
+    max_iter : int
+    tabu_length : int
+        Number of recent operations kept in the tabu list.
+    limit_table_size : bool
+    """
+
+    def __init__(
+        self,
+        scoring: ScoringMethod,
+        max_parents: Optional[int] = None,
+        max_iter: int = 1000,
+        tabu_length: int = 10,
+        patience: Optional[int] = None,
+        limit_table_size: bool = True,
+    ) -> None:
+        self.scoring = scoring
+        self.max_parents = max_parents
+        self.max_iter = max_iter
+        self.tabu_length = tabu_length
+        # patience: stop after this many consecutive iterations without improving
+        # the global best.  None → 5 * tabu_length (enough to escape local optima).
+        self.patience = patience
+        self.limit_table_size = limit_table_size
+
+    @staticmethod
+    def _reverse_op(op: str, u: int, v: int) -> tuple:
+        if op == "add":
+            return ("del", u, v)
+        if op == "del":
+            return ("add", u, v)
+        return ("rev", v, u)
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Return adjacency matrix learned from *data*."""
+        n_samples = data.shape[0]
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+
+        perm_pos = _compute_perm_pos(n_vars, permutation)
+        allowed = _build_allowed_parents(n_vars, perm_pos, interaction_matrix)
+        perm_constrained = perm_pos is not None
+
+        scorer = self.scoring if sample_weights is None else self.scoring.with_weights(sample_weights)
+        cache: dict = {}
+
+        def local(var: int, parents: List[int]) -> float:
+            key = (var, tuple(sorted(parents)))
+            if key not in cache:
+                cache[key] = scorer.local_score(var, list(parents), data, cardinality)
+            return cache[key]
+
+        def parents_of(var: int) -> List[int]:
+            return list(np.where(adjacency[:, var] > 0)[0])
+
+        def total_score() -> float:
+            return sum(local(var, parents_of(var)) for var in range(n_vars))
+
+        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        tabu: List[tuple] = []
+        # Track total score incrementally: BIC is decomposable, so the delta
+        # returned by each operation is the exact change in total score.
+        # This avoids calling total_score() (O(n × scoring)) inside the loop.
+        current_score = total_score()   # computed once at initialisation
+        best_score = current_score
+        best_adj = adjacency.copy()
+        patience = self.patience if self.patience is not None else max(self.tabu_length * 5, 50)
+        no_improve = 0
+
+        for _ in range(self.max_iter):
+            best_nontabu_key = None
+            best_nontabu_op: Optional[tuple] = None
+            best_tabu_key = None
+            best_tabu_op: Optional[tuple] = None
+
+            for u in range(n_vars):
+                for v in range(n_vars):
+                    if u == v:
+                        continue
+
+                    # ADD u → v
+                    if adjacency[u, v] == 0 and adjacency[v, u] == 0 and u in allowed[v]:
+                        pa_v = parents_of(v)
+                        if len(pa_v) < mp:
+                            if perm_constrained or not _would_create_cycle(adjacency, u, v):
+                                new_pa = pa_v + [u]
+                                if not self.limit_table_size or _joint_table_size(cardinality, [v] + new_pa) <= n_samples:
+                                    delta = local(v, new_pa) - local(v, pa_v)
+                                    k = _op_key(delta, "add", u, v)
+                                    if ("add", u, v) in tabu:
+                                        if best_tabu_key is None or k > best_tabu_key:
+                                            best_tabu_key, best_tabu_op = k, ("add", u, v)
+                                    else:
+                                        if best_nontabu_key is None or k > best_nontabu_key:
+                                            best_nontabu_key, best_nontabu_op = k, ("add", u, v)
+
+                    # DELETE u → v
+                    if adjacency[u, v] == 1:
+                        pa_v = parents_of(v)
+                        new_pa = [p for p in pa_v if p != u]
+                        delta = local(v, new_pa) - local(v, pa_v)
+                        k = _op_key(delta, "del", u, v)
+                        if ("del", u, v) in tabu:
+                            if best_tabu_key is None or k > best_tabu_key:
+                                best_tabu_key, best_tabu_op = k, ("del", u, v)
+                        else:
+                            if best_nontabu_key is None or k > best_nontabu_key:
+                                best_nontabu_key, best_nontabu_op = k, ("del", u, v)
+
+                    # REVERSE u → v  becomes  v → u
+                    if adjacency[u, v] == 1 and v in allowed[u]:
+                        pa_u = parents_of(u)
+                        pa_v = parents_of(v)
+                        if len(pa_u) < mp:
+                            can_rev: bool
+                            if perm_constrained:
+                                can_rev = True
+                            else:
+                                adjacency[u, v] = 0
+                                can_rev = not _would_create_cycle(adjacency, v, u)
+                                adjacency[u, v] = 1
+                            if can_rev:
+                                new_pa_u = pa_u + [v]
+                                new_pa_v = [p for p in pa_v if p != u]
+                                if not self.limit_table_size or _joint_table_size(cardinality, [u] + new_pa_u) <= n_samples:
+                                    delta = (
+                                        local(v, new_pa_v) + local(u, new_pa_u)
+                                        - local(v, pa_v) - local(u, pa_u)
+                                    )
+                                    k = _op_key(delta, "rev", u, v)
+                                    if ("rev", u, v) in tabu:
+                                        if best_tabu_key is None or k > best_tabu_key:
+                                            best_tabu_key, best_tabu_op = k, ("rev", u, v)
+                                    else:
+                                        if best_nontabu_key is None or k > best_nontabu_key:
+                                            best_nontabu_key, best_nontabu_op = k, ("rev", u, v)
+
+            # ----------------------------------------------------------------
+            # Move selection
+            #
+            # Unlike HC-Stable, Tabu accepts non-improving moves to escape
+            # local optima; the tabu list prevents cycling back immediately.
+            #
+            # Aspiration criterion: a tabu move overrides its tabu status when
+            # it is strictly better than the best non-tabu candidate AND the
+            # resulting score would exceed the global best.  The comparison uses
+            # current_score (tracked incrementally) — no extra scoring calls.
+            # ----------------------------------------------------------------
+            chosen_key = best_nontabu_key
+            chosen_op = best_nontabu_op
+
+            if best_tabu_op is not None:
+                nontabu_delta = best_nontabu_key[0] if best_nontabu_key is not None else float('-inf')
+                tabu_delta = best_tabu_key[0]
+                if tabu_delta > nontabu_delta and current_score + tabu_delta > best_score:
+                    chosen_key, chosen_op = best_tabu_key, best_tabu_op
+
+            if chosen_op is None:
+                break  # No moves available at all
+
+            # Apply move (delta is the change in total BIC; no extra score call needed)
+            chosen_delta = chosen_key[0]
+            op, u, v = chosen_op
+            if op == "add":
+                adjacency[u, v] = 1
+            elif op == "del":
+                adjacency[u, v] = 0
+            else:  # rev
+                adjacency[u, v] = 0
+                adjacency[v, u] = 1
+
+            for key in [k for k in cache if k[0] in (u, v)]:
+                cache.pop(key, None)
+
+            current_score += chosen_delta
+
+            tabu.append(self._reverse_op(op, u, v))
+            if len(tabu) > self.tabu_length:
+                tabu.pop(0)
+
+            # Track global best; early-stop after 'patience' non-improving steps
+            if current_score > best_score:
+                best_score = current_score
+                best_adj = adjacency.copy()
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    break
+
+        return best_adj

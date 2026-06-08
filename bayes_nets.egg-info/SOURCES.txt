@@ -2,6 +2,8 @@ README.md
 pyproject.toml
 bayes_nets/__init__.py
 bayes_nets/bayesian_network.py
+bayes_nets/factorization.py
+bayes_nets/inference.py
 bayes_nets/parameter_learning.py
 bayes_nets/sampling.py
 bayes_nets/scoring.py

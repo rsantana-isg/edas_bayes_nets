@@ -1,0 +1,125 @@
+{
+  "name": "moodstate",
+  "n_vars": 7,
+  "n_edges": 6,
+  "n_samples": 2000,
+  "description": "Small, mixed cardinality (up to 7 states)",
+  "var_names": [
+    "DepressiveState",
+    "MoodState",
+    "Irritability",
+    "Anxiety",
+    "Energy",
+    "Sleep",
+    "EEG"
+  ],
+  "cardinality": [
+    2,
+    7,
+    2,
+    2,
+    2,
+    2,
+    2
+  ],
+  "adjacency": [
+    [
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  ],
+  "var_states": {
+    "DepressiveState": [
+      "TRUE",
+      "FALSE"
+    ],
+    "MoodState": [
+      "+3",
+      "+2",
+      "+1",
+      "0",
+      "-1",
+      "-2",
+      "-3"
+    ],
+    "Irritability": [
+      "0-3",
+      "4-5"
+    ],
+    "Anxiety": [
+      "0-2",
+      "3-5"
+    ],
+    "Energy": [
+      "0-2",
+      "3-5"
+    ],
+    "Sleep": [
+      "<6 Hours",
+      ">6 Hours"
+    ],
+    "EEG": [
+      ">0",
+      "<0"
+    ]
+  }
+}

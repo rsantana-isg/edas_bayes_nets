@@ -124,33 +124,45 @@ class BayesianNetwork:
         self,
         data: np.ndarray,
         method: str = "bic",
-        max_parents: int = 3,
+        max_parents: Optional[int] = None,
         alpha: float = 1.0,
         ordering: Optional[np.ndarray] = None,
         limit_table_size: bool = True,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
     ) -> "BayesianNetwork":
         """Learn structure **and** parameters from *data*.
 
         Parameters
         ----------
         data : np.ndarray, shape (n_samples, n_vars)
-            Observed discrete data. Values must be integers in
+            Observed discrete data.  Values must be integers in
             ``[0, cardinality[j])`` for each column j.
-        method : {"bic", "aic", "k2"}
-            Scoring metric used for structure learning.
-            ``"k2"`` uses the K2 algorithm with the given *ordering*;
-            ``"bic"`` and ``"aic"`` use greedy hill-climbing.
-        max_parents : int
-            Maximum number of parents per variable.
+        method : {"bic", "aic", "k2", "stable_hc", "tabu"}
+            Scoring / search algorithm.
+        max_parents : int or None
+            Maximum parents per variable.  ``None`` → rule of thumb
+            ``max(1, floor(10·log2/log(max_cardinality)))``
+            (10 for binary variables).
         alpha : float
             Dirichlet/Laplace smoothing parameter (>= 0).
         ordering : array-like of int, optional
-            Variable ordering for the K2 algorithm.  Ignored when
-            ``method`` is ``"bic"`` or ``"aic"``.  Defaults to the
-            natural order ``[0, 1, ..., n_vars-1]``.
+            Legacy K2 ordering parameter.  Use ``permutation`` instead.
         limit_table_size : bool
-            If True, skip candidate parent sets whose joint table size
-            exceeds the number of samples (avoids over-fitting).
+            Skip parent sets whose joint table exceeds n_samples.
+        permutation : array-like of int, optional
+            Permutation σ of [0 … n_vars-1].  Parents of σ(j) are
+            restricted to {σ(i) : i < j}.  Applies to all methods.
+            ``None`` → unconstrained (cycle detection used for HC).
+        interaction_matrix : np.ndarray, shape (n_vars, n_vars), optional
+            Symmetric binary matrix.  Edge u → v considered only when
+            ``interaction_matrix[u, v] == 1``.  ``None`` → all allowed.
+        sample_weights : array of float, shape (n_samples,), optional
+            Probability vector (must sum to 1).  Weighted counts replace
+            raw counts during structure and parameter learning.
+            ``None`` → uniform 1/N.
 
         Returns
         -------
@@ -158,6 +170,7 @@ class BayesianNetwork:
         """
         data = np.asarray(data, dtype=int)
         self._validate_data(data)
+        self._validate_new_params(data.shape[0], permutation, interaction_matrix, sample_weights)
 
         self.learn_structure(
             data,
@@ -166,75 +179,125 @@ class BayesianNetwork:
             alpha=alpha,
             ordering=ordering,
             limit_table_size=limit_table_size,
+            permutation=permutation,
+            interaction_matrix=interaction_matrix,
+            sample_weights=sample_weights,
         )
-        self.learn_parameters(data, alpha=alpha)
+        self.learn_parameters(data, alpha=alpha, sample_weights=sample_weights)
         return self
 
     def learn_structure(
         self,
         data: np.ndarray,
         method: str = "bic",
-        max_parents: int = 3,
+        max_parents: Optional[int] = None,
         alpha: float = 1.0,
         ordering: Optional[np.ndarray] = None,
         limit_table_size: bool = True,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
     ) -> "BayesianNetwork":
         """Learn the DAG structure from *data*.
 
-        Resets any existing structure before learning.
+        Resets any existing structure before learning.  See :meth:`fit`
+        for full parameter documentation.
         """
         from bayes_nets.structure_learning import (
             K2StructureLearner,
             GreedyHillClimbLearner,
+            StableHillClimbLearner,
+            TabuHillClimbLearner,
         )
-        from bayes_nets.scoring import (
-            BICScoringMethod,
-            AICScoringMethod,
-            K2ScoringMethod,
-        )
+        from bayes_nets.scoring import BICScoringMethod, AICScoringMethod
 
         data = np.asarray(data, dtype=int)
 
+        # permutation overrides legacy ordering for K2
+        eff_perm = permutation if permutation is not None else (
+            np.asarray(ordering, dtype=int) if ordering is not None else None
+        )
+
         method = method.lower()
+
+        learn_kwargs = dict(
+            permutation=eff_perm,
+            interaction_matrix=interaction_matrix,
+            sample_weights=sample_weights,
+        )
+
         if method == "k2":
-            if ordering is None:
-                ordering = np.arange(self.n_vars)
             learner = K2StructureLearner(
                 max_parents=max_parents,
                 alpha=alpha,
                 limit_table_size=limit_table_size,
             )
-            self.adjacency = learner.learn(
-                data, self.n_vars, self.cardinality, np.asarray(ordering, dtype=int)
-            )
+            self.adjacency = learner.learn(data, self.n_vars, self.cardinality, **learn_kwargs)
+
         elif method in ("bic", "aic"):
             scoring_cls = BICScoringMethod if method == "bic" else AICScoringMethod
-            scoring = scoring_cls(alpha=alpha)
+            scoring = scoring_cls(alpha=alpha, sample_weights=sample_weights)
             learner = GreedyHillClimbLearner(
                 scoring=scoring,
                 max_parents=max_parents,
                 limit_table_size=limit_table_size,
             )
-            self.adjacency = learner.learn(data, self.n_vars, self.cardinality)
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+                # sample_weights already embedded in scoring object
+            )
+
+        elif method in ("stable_hc", "tabu"):
+            scoring = BICScoringMethod(alpha=alpha, sample_weights=sample_weights)
+            cls = StableHillClimbLearner if method == "stable_hc" else TabuHillClimbLearner
+            learner = cls(
+                scoring=scoring,
+                max_parents=max_parents,
+                limit_table_size=limit_table_size,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+            )
+
         else:
-            raise ValueError(f"Unknown method '{method}'. Choose 'bic', 'aic', or 'k2'.")
+            raise ValueError(
+                f"Unknown method '{method}'. "
+                "Choose 'bic', 'aic', 'k2', 'stable_hc', or 'tabu'."
+            )
 
         self.cpds = {}
         return self
 
     def learn_parameters(
-        self, data: np.ndarray, alpha: float = 1.0
+        self,
+        data: np.ndarray,
+        alpha: float = 1.0,
+        *,
+        sample_weights: Optional[np.ndarray] = None,
     ) -> "BayesianNetwork":
         """Estimate CPDs from *data* given the current structure.
 
-        Uses maximum-likelihood estimation with optional Dirichlet
-        (Laplace) smoothing controlled by *alpha*.
+        Parameters
+        ----------
+        data : np.ndarray, shape (n_samples, n_vars)
+        alpha : float
+            Dirichlet/Laplace smoothing.
+        sample_weights : array of float, shape (n_samples,), optional
+            Probability vector (must sum to 1).
         """
         from bayes_nets.parameter_learning import MLEParameterLearner
 
         data = np.asarray(data, dtype=int)
         learner = MLEParameterLearner(alpha=alpha)
-        self.cpds = learner.learn(data, self.n_vars, self.cardinality, self.adjacency)
+        self.cpds = learner.learn(
+            data, self.n_vars, self.cardinality, self.adjacency,
+            sample_weights=sample_weights,
+        )
         return self
 
     # ------------------------------------------------------------------
@@ -490,6 +553,41 @@ class BayesianNetwork:
             raise ValueError(
                 f"data has {data.shape[1]} columns but n_vars={self.n_vars}"
             )
+
+    def _validate_new_params(
+        self,
+        n_samples: int,
+        permutation: Optional[np.ndarray],
+        interaction_matrix: Optional[np.ndarray],
+        sample_weights: Optional[np.ndarray],
+    ) -> None:
+        if permutation is not None:
+            p = np.asarray(permutation, dtype=int)
+            if p.shape != (self.n_vars,) or set(p.tolist()) != set(range(self.n_vars)):
+                raise ValueError(
+                    "permutation must be a valid permutation of [0, ..., n_vars-1]"
+                )
+        if interaction_matrix is not None:
+            im = np.asarray(interaction_matrix)
+            if im.shape != (self.n_vars, self.n_vars):
+                raise ValueError(
+                    f"interaction_matrix must have shape ({self.n_vars}, {self.n_vars})"
+                )
+            if not np.array_equal(im, im.T):
+                raise ValueError("interaction_matrix must be symmetric")
+        if sample_weights is not None:
+            sw = np.asarray(sample_weights, dtype=float)
+            if sw.shape != (n_samples,):
+                raise ValueError(
+                    f"sample_weights must have shape ({n_samples},)"
+                )
+            if sw.min() < 0:
+                raise ValueError("sample_weights must be non-negative")
+            total = sw.sum()
+            if not np.isclose(total, 1.0, atol=1e-6):
+                raise ValueError(
+                    f"sample_weights must sum to 1 (got {total:.6f})"
+                )
 
     def _would_create_cycle(self, parent: int, child: int) -> bool:
         """Return True if adding edge parent → child would create a cycle."""
