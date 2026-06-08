@@ -164,6 +164,157 @@ def _split_clique(clique: np.ndarray, max_width: int) -> List[np.ndarray]:
     return parts
 
 
+def _induced_subgraph(adjacency: np.ndarray, nodes: np.ndarray) -> np.ndarray:
+    return np.asarray(adjacency[np.ix_(nodes, nodes)], dtype=int)
+
+
+def _connected_components_nodes(adjacency: np.ndarray, nodes: np.ndarray) -> List[np.ndarray]:
+    node_set = set(int(v) for v in nodes.tolist())
+    seen: set[int] = set()
+    components: List[np.ndarray] = []
+
+    for start in sorted(node_set):
+        if start in seen:
+            continue
+        stack = [start]
+        comp: List[int] = []
+        while stack:
+            v = stack.pop()
+            if v in seen:
+                continue
+            seen.add(v)
+            comp.append(v)
+            neigh = np.where(adjacency[v] > 0)[0]
+            for nxt in neigh:
+                nxt_i = int(nxt)
+                if nxt_i in node_set and nxt_i not in seen:
+                    stack.append(nxt_i)
+        components.append(_as_int_array(comp))
+
+    return components
+
+
+def _is_clique(adjacency: np.ndarray, nodes: np.ndarray) -> bool:
+    if len(nodes) <= 1:
+        return True
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            if adjacency[int(nodes[i]), int(nodes[j])] == 0:
+                return False
+    return True
+
+
+def _find_clique_separator(adjacency: np.ndarray, nodes: np.ndarray) -> Optional[np.ndarray]:
+    """Find a clique separator in the induced graph, if one exists."""
+    node_set = set(int(v) for v in nodes.tolist())
+
+    # Singleton clique separators (articulation vertices).
+    for v in sorted(node_set):
+        rest = _as_int_array([u for u in node_set if u != v])
+        if len(rest) <= 1:
+            continue
+        comps = _connected_components_nodes(adjacency, rest)
+        if len(comps) > 1:
+            return np.array([v], dtype=int)
+
+    # Multi-node candidates via common-neighbor cliques of adjacent pairs.
+    candidates: List[np.ndarray] = []
+    node_list = sorted(node_set)
+    for i in range(len(node_list)):
+        u = node_list[i]
+        neigh_u = set(int(x) for x in np.where(adjacency[u] > 0)[0] if int(x) in node_set)
+        for j in range(i + 1, len(node_list)):
+            v = node_list[j]
+            if adjacency[u, v] == 0:
+                continue
+            neigh_v = set(int(x) for x in np.where(adjacency[v] > 0)[0] if int(x) in node_set)
+            inter = _as_int_array(neigh_u.intersection(neigh_v))
+            if len(inter) <= 1:
+                continue
+            if _is_clique(adjacency, inter):
+                candidates.append(inter)
+
+    candidates.sort(key=lambda s: (len(s), tuple(s.tolist())))
+    for sep in candidates:
+        sep_set = set(int(v) for v in sep.tolist())
+        rest = _as_int_array([u for u in node_set if u not in sep_set])
+        if len(rest) == 0:
+            continue
+        comps = _connected_components_nodes(adjacency, rest)
+        if len(comps) > 1:
+            return sep
+
+    return None
+
+
+def _decompose_by_clique_separators(adjacency: np.ndarray) -> List[np.ndarray]:
+    """Recursively decompose graph into atoms using clique separators."""
+    n = adjacency.shape[0]
+    all_nodes = _as_int_array(range(n))
+
+    atoms: List[np.ndarray] = []
+
+    def recurse(nodes: np.ndarray) -> None:
+        if len(nodes) <= 2:
+            atoms.append(nodes)
+            return
+
+        sep = _find_clique_separator(adjacency, nodes)
+        if sep is None:
+            atoms.append(nodes)
+            return
+
+        node_set = set(int(v) for v in nodes.tolist())
+        sep_set = set(int(v) for v in sep.tolist())
+        rest = _as_int_array([u for u in node_set if u not in sep_set])
+        comps = _connected_components_nodes(adjacency, rest)
+        if len(comps) <= 1:
+            atoms.append(nodes)
+            return
+
+        progressed = False
+        for comp in comps:
+            block = _as_int_array(np.concatenate((comp, sep)))
+            if len(block) < len(nodes):
+                progressed = True
+                recurse(block)
+
+        if not progressed:
+            atoms.append(nodes)
+
+    recurse(all_nodes)
+
+    uniq: List[np.ndarray] = []
+    for atom in atoms:
+        a = _as_int_array(atom)
+        if not any(np.array_equal(a, b) for b in uniq):
+            uniq.append(a)
+    uniq.sort(key=lambda a: (len(a), tuple(a.tolist())))
+    return uniq
+
+
+def _triangulate_block(
+    moral_adjacency: np.ndarray,
+    block_nodes: np.ndarray,
+    method: str,
+) -> Tuple[List[int], List[np.ndarray]]:
+    work = np.zeros_like(moral_adjacency)
+    work[np.ix_(block_nodes, block_nodes)] = moral_adjacency[np.ix_(block_nodes, block_nodes)]
+
+    remaining = set(int(v) for v in block_nodes.tolist())
+    order: List[int] = []
+    cliques: List[np.ndarray] = []
+
+    while remaining:
+        node = min(remaining, key=lambda x: _selection_cost(work, x, method))
+        order.append(node)
+        work, clique = _add_fill_edges(work, node)
+        cliques.append(clique)
+        remaining.remove(node)
+
+    return order, cliques
+
+
 def triangulate(
     moral_adjacency: np.ndarray,
     cardinality: np.ndarray,
@@ -182,16 +333,14 @@ def triangulate(
     n = work.shape[0]
     np.fill_diagonal(work, 0)
 
-    remaining = set(range(n))
+    atoms = _decompose_by_clique_separators(work)
     order: List[int] = []
     elimination_cliques: List[np.ndarray] = []
 
-    while remaining:
-        node = min(remaining, key=lambda x: _selection_cost(work, x, method))
-        order.append(node)
-        work, clique = _add_fill_edges(work, node)
-        elimination_cliques.append(clique)
-        remaining.remove(node)
+    for atom in atoms:
+        local_order, local_cliques = _triangulate_block(work, atom, method)
+        order.extend(local_order)
+        elimination_cliques.extend(local_cliques)
 
     cliques = _maximal_cliques(elimination_cliques)
 

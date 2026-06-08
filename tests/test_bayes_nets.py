@@ -217,6 +217,12 @@ class TestStructureLearning:
         with pytest.raises(ValueError):
             bn.fit(simple_data, method="unknown")
 
+    def test_fit_grow_shrink(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="gs", max_parents=2, alpha=0.05)
+        assert bn.is_dag()
+        assert bn.adjacency.sum() > 0
+
 
 # ---------------------------------------------------------------------------
 # Parameter learning
@@ -374,6 +380,22 @@ class TestFactorization:
                 np.testing.assert_allclose(np.sum(table), 1.0, atol=1e-9)
             else:
                 np.testing.assert_allclose(np.sum(table, axis=1), 1.0, atol=1e-9)
+
+    def test_triangulate_respects_clique_separator_decomposition(self):
+        graph = np.zeros((5, 5), dtype=int)
+        # triangle 0-1-2
+        graph[0, 1] = graph[1, 0] = 1
+        graph[1, 2] = graph[2, 1] = 1
+        graph[0, 2] = graph[2, 0] = 1
+        # triangle 2-3-4 with separator {2}
+        graph[2, 3] = graph[3, 2] = 1
+        graph[3, 4] = graph[4, 3] = 1
+        graph[2, 4] = graph[4, 2] = 1
+
+        _, _, cliques = triangulate(graph, np.array([2, 2, 2, 2, 2]))
+        clique_sets = [set(c.tolist()) for c in cliques]
+        assert {0, 1, 2} in clique_sets
+        assert {2, 3, 4} in clique_sets
 
 
 class TestInference:
