@@ -12,3 +12,4 @@ bayes_nets.egg-info/SOURCES.txt
 bayes_nets.egg-info/dependency_links.txt
 bayes_nets.egg-info/requires.txt
 bayes_nets.egg-info/top_level.txt
+tests/test_bayes_nets.py
