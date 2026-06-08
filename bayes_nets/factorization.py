@@ -432,6 +432,11 @@ def bn_to_factorization(
         adjacency_list[i].append(j)
         adjacency_list[j].append(i)
 
+    if len(cliques) == 0:
+        cliques = [_as_int_array([var]) for var in range(adjacency.shape[0])]
+        tree_edges, separators = junction_tree(cliques)
+        order, parent = _order_cliques_for_sampling(cliques, tree_edges)
+
     max_clique_size = max((len(c) for c in cliques), default=1)
     structure = np.zeros((len(order), 2 + 2 * max_clique_size), dtype=int)
     tables: List[np.ndarray] = []
