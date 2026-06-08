@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
+
+MIN_NODES_FOR_DECOMPOSITION = 2
 
 
 def _as_int_array(values: Iterable[int]) -> np.ndarray:
@@ -170,7 +172,7 @@ def _induced_subgraph(adjacency: np.ndarray, nodes: np.ndarray) -> np.ndarray:
 
 def _connected_components_nodes(adjacency: np.ndarray, nodes: np.ndarray) -> List[np.ndarray]:
     node_set = set(int(v) for v in nodes.tolist())
-    seen: set[int] = set()
+    seen: Set[int] = set()
     components: List[np.ndarray] = []
 
     for start in sorted(node_set):
@@ -255,7 +257,8 @@ def _decompose_by_clique_separators(adjacency: np.ndarray) -> List[np.ndarray]:
     atoms: List[np.ndarray] = []
 
     def recurse(nodes: np.ndarray) -> None:
-        if len(nodes) <= 2:
+        if len(nodes) <= MIN_NODES_FOR_DECOMPOSITION:
+            # Graphs with <=2 nodes are already chordal and have no non-trivial separators.
             atoms.append(nodes)
             return
 

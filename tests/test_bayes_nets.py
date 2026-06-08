@@ -222,6 +222,7 @@ class TestStructureLearning:
         bn.fit(simple_data, method="gs", max_parents=2, alpha=0.05)
         assert bn.is_dag()
         assert bn.adjacency.sum() > 0
+        assert (bn.adjacency.sum(axis=0) <= 2).all()
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +383,7 @@ class TestFactorization:
                 np.testing.assert_allclose(np.sum(table, axis=1), 1.0, atol=1e-9)
 
     def test_triangulate_respects_clique_separator_decomposition(self):
+        """Clique-separator split should preserve both separator-connected cliques."""
         graph = np.zeros((5, 5), dtype=int)
         # triangle 0-1-2
         graph[0, 1] = graph[1, 0] = 1

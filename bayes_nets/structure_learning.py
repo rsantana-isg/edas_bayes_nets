@@ -53,7 +53,7 @@ sample_weights : array of float, shape (n_samples,), optional
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from scipy.stats import chi2 as chi2_dist
@@ -717,6 +717,7 @@ def _weighted_contingency(
     card_y: int,
     weights: np.ndarray,
 ) -> np.ndarray:
+    """Build a weighted X-by-Y contingency table."""
     table = np.zeros((card_x, card_y), dtype=float)
     np.add.at(table, (x, y), weights)
     return table
@@ -729,7 +730,7 @@ def _chi_square_conditional_independence(
     cond: List[int],
     cardinality: np.ndarray,
     alpha: float,
-    sample_weights: np.ndarray,
+    weights: np.ndarray,
 ) -> bool:
     """Return True when X ⟂ Y | cond under a stratified chi-square test."""
     card_x = int(cardinality[x])
@@ -739,7 +740,7 @@ def _chi_square_conditional_independence(
     total_dof = 0
 
     if len(cond) == 0:
-        table = _weighted_contingency(data[:, x], data[:, y], card_x, card_y, sample_weights)
+        table = _weighted_contingency(data[:, x], data[:, y], card_x, card_y, weights)
         row_sum = table.sum(axis=1, keepdims=True)
         col_sum = table.sum(axis=0, keepdims=True)
         n = table.sum()
@@ -771,7 +772,7 @@ def _chi_square_conditional_independence(
             data[mask, y],
             card_x,
             card_y,
-            sample_weights[mask],
+            weights[mask],
         )
         n = table.sum()
         if n <= 0:
@@ -780,7 +781,9 @@ def _chi_square_conditional_independence(
         col_sum = table.sum(axis=0, keepdims=True)
         expected = (row_sum @ col_sum) / n
         valid = expected > 0
-        dof = (int(np.sum(row_sum[:, 0] > 0)) - 1) * (int(np.sum(col_sum[0, :] > 0)) - 1)
+        active_rows = int(np.sum(row_sum[:, 0] > 0))
+        active_cols = int(np.sum(col_sum[0, :] > 0))
+        dof = (active_rows - 1) * (active_cols - 1)
         if dof <= 0 or not np.any(valid):
             continue
         total_stat += float(np.sum(((table - expected) ** 2 / expected)[valid]))
@@ -824,10 +827,10 @@ class GrowShrinkLearner:
             if total_w > 0:
                 weights = weights * (len(weights) / total_w)
 
-        markov_blankets: List[set[int]] = [set() for _ in range(n_vars)]
+        markov_blankets: List[Set[int]] = [set() for _ in range(n_vars)]
 
         for target in range(n_vars):
-            blanket: set[int] = set()
+            blanket: Set[int] = set()
             changed = True
             while changed:
                 changed = False
@@ -844,7 +847,7 @@ class GrowShrinkLearner:
                         blanket.add(var)
                         changed = True
 
-            for var in sorted(list(blanket)):
+            for var in sorted(blanket):
                 cond = sorted(list(blanket - {var}))
                 independent = _chi_square_conditional_independence(
                     data, target, var, cond, cardinality, self.alpha_ci, weights
