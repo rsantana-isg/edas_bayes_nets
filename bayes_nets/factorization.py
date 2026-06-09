@@ -132,10 +132,10 @@ def _block_order_from_search(
     if method == "mcs":
         weights: Dict[int, int] = {int(v): 0 for v in block_nodes.tolist()}
         while remaining:
-            node = min(remaining, key=lambda v: (-weights[v], v))
-            order.append(node)
-            remaining.remove(node)
-            neighbors = np.where(moral_adjacency[node] > 0)[0]
+            max_weight_node = min(remaining, key=lambda v: (-weights[v], v))
+            order.append(max_weight_node)
+            remaining.remove(max_weight_node)
+            neighbors = np.where(moral_adjacency[max_weight_node] > 0)[0]
             for n in neighbors:
                 n_i = int(n)
                 if n_i in remaining:
@@ -146,10 +146,10 @@ def _block_order_from_search(
         labels: Dict[int, Tuple[int, ...]] = {int(v): tuple() for v in block_nodes.tolist()}
         tag = len(block_nodes)
         while remaining:
-            node = max(remaining, key=lambda v: (labels[v], -v))
-            order.append(node)
-            remaining.remove(node)
-            neighbors = np.where(moral_adjacency[node] > 0)[0]
+            max_label_node = max(remaining, key=lambda v: (labels[v], -v))
+            order.append(max_label_node)
+            remaining.remove(max_label_node)
+            neighbors = np.where(moral_adjacency[max_label_node] > 0)[0]
             for n in neighbors:
                 n_i = int(n)
                 if n_i in remaining:

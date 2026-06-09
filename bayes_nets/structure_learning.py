@@ -56,7 +56,7 @@ sample_weights : array of float, shape (n_samples,), optional
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -1117,8 +1117,9 @@ class RPCDLearner:
             results: List[Tuple[int, int, bool]] = []
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {pool.submit(_is_dependent, x, y, nodes): (x, y) for x, y in pairs}
-                for future, (x, y) in futures.items():
-                    results.append((x, y, bool(future.result())))
+                for future in as_completed(futures):
+                    x, y = futures[future]
+                    results.append((x, y, bool(future.result(timeout=60))))
             return results
 
         def _discover(nodes: List[int]) -> None:
