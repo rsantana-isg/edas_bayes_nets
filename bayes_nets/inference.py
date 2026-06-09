@@ -213,7 +213,9 @@ class MaxProductInference:
 
         Uses a Nilsson/Lawler priority-queue search.  Each candidate is
         found by running VE-MAP with partial evidence, guaranteeing exact
-        results with no duplicates.
+        results with no duplicates.  When ``search_method`` is set to
+        ``"a_star_bb"``/``"flerova"``, uses an A*/branch-and-bound
+        search strategy inspired by Flerova et al.
 
         Parameters
         ----------

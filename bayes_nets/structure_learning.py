@@ -1030,12 +1030,17 @@ class RPCDLearner:
         max_conditioning_set: int = 2,
         max_workers: Optional[int] = None,
         min_parallel_pairs: int = 8,
+        ci_test_timeout: float = 60.0,
     ) -> None:
+        if max_conditioning_set < 0:
+            raise ValueError("max_conditioning_set must be >= 0")
         self.alpha_ci = alpha_ci
         self.max_parents = max_parents
-        self.max_conditioning_set = max(0, int(max_conditioning_set))
+        self.max_conditioning_set = int(max_conditioning_set)
         self.max_workers = max_workers
+        # Keep threshold at >=1 so sequential fallback is still available.
         self.min_parallel_pairs = max(1, int(min_parallel_pairs))
+        self.ci_test_timeout = float(ci_test_timeout)
 
     def learn(
         self,
@@ -1119,7 +1124,7 @@ class RPCDLearner:
                 futures = {pool.submit(_is_dependent, x, y, nodes): (x, y) for x, y in pairs}
                 for future in as_completed(futures):
                     x, y = futures[future]
-                    results.append((x, y, bool(future.result(timeout=60))))
+                    results.append((x, y, bool(future.result(timeout=self.ci_test_timeout))))
             return results
 
         def _discover(nodes: List[int]) -> None:

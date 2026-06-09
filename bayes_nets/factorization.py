@@ -146,6 +146,7 @@ def _block_order_from_search(
         labels: Dict[int, Tuple[int, ...]] = {int(v): tuple() for v in block_nodes.tolist()}
         tag = len(block_nodes)
         while remaining:
+            # Tie-break equal labels by smallest node id for deterministic output.
             max_label_node = max(remaining, key=lambda v: (labels[v], -v))
             order.append(max_label_node)
             remaining.remove(max_label_node)
