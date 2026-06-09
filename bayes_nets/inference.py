@@ -32,6 +32,8 @@ import numpy as np
 
 from bayes_nets.bayesian_network import BayesianNetwork
 
+MAX_LOOPY_DAMPING = 0.99
+
 
 # ---------------------------------------------------------------------------
 # Factor algebra helpers
@@ -175,7 +177,7 @@ class MaxProductInference:
         self.loopy_treewidth_threshold = loopy_treewidth_threshold
         self.loopy_max_iter = max(1, int(loopy_max_iter))
         self.loopy_tol = float(loopy_tol)
-        self.loopy_damping = float(np.clip(loopy_damping, 0.0, 0.99))
+        self.loopy_damping = float(np.clip(loopy_damping, 0.0, MAX_LOOPY_DAMPING))
 
     # ------------------------------------------------------------------
     # Public API
@@ -385,6 +387,7 @@ class MaxProductInference:
             moral = moralize(self.bn.adjacency)
             _, order, cliques = triangulate(moral, self.bn.cardinality, method="min-fill")
             self._elim_order = list(order)
+            # Empty cliques can occur for degenerate empty-graph cases.
             self._treewidth_estimate = max((len(c) - 1 for c in cliques), default=0)
         return self._elim_order
 

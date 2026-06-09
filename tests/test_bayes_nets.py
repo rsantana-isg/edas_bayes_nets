@@ -462,4 +462,5 @@ class TestInference:
         assert configs.shape == (3, 2)
         assert probs.shape == (3,)
         assert np.all(probs[:-1] >= probs[1:])
-        assert len({tuple(c.tolist()) for c in configs}) == len(configs)
+        unique_configs = {tuple(c.tolist()) for c in configs}
+        assert len(unique_configs) == len(configs)
