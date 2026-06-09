@@ -119,6 +119,48 @@ def _selection_cost(work: np.ndarray, node: int, method: str) -> Tuple[int, int,
     return fill_in, degree, node
 
 
+def _block_order_from_search(
+    moral_adjacency: np.ndarray,
+    block_nodes: np.ndarray,
+    method: str,
+) -> List[int]:
+    """Return an elimination order from a graph-search heuristic."""
+    block_nodes = _as_int_array(block_nodes)
+    remaining: Set[int] = set(int(v) for v in block_nodes.tolist())
+    order: List[int] = []
+
+    if method == "mcs":
+        weights: Dict[int, int] = {int(v): 0 for v in block_nodes.tolist()}
+        while remaining:
+            max_weight_node = min(remaining, key=lambda v: (-weights[v], v))
+            order.append(max_weight_node)
+            remaining.remove(max_weight_node)
+            neighbors = np.where(moral_adjacency[max_weight_node] > 0)[0]
+            for n in neighbors:
+                n_i = int(n)
+                if n_i in remaining:
+                    weights[n_i] += 1
+        return order
+
+    if method == "lexm":
+        labels: Dict[int, Tuple[int, ...]] = {int(v): tuple() for v in block_nodes.tolist()}
+        tag = len(block_nodes)
+        while remaining:
+            # Tie-break equal labels by smallest node id for deterministic output.
+            max_label_node = max(remaining, key=lambda v: (labels[v], -v))
+            order.append(max_label_node)
+            remaining.remove(max_label_node)
+            neighbors = np.where(moral_adjacency[max_label_node] > 0)[0]
+            for n in neighbors:
+                n_i = int(n)
+                if n_i in remaining:
+                    labels[n_i] = labels[n_i] + (tag,)
+            tag -= 1
+        return order
+
+    raise ValueError(f"Unknown search ordering method '{method}'")
+
+
 def _maximal_cliques(cliques: List[np.ndarray]) -> List[np.ndarray]:
     uniq: List[np.ndarray] = []
     for clique in cliques:
@@ -308,8 +350,15 @@ def _triangulate_block(
     order: List[int] = []
     cliques: List[np.ndarray] = []
 
+    order_hint: Optional[List[int]] = None
+    if method in {"mcs", "lexm"}:
+        order_hint = _block_order_from_search(moral_adjacency, block_nodes, method)
+
     while remaining:
-        node = min(remaining, key=lambda x: _selection_cost(work, x, method))
+        if order_hint is None:
+            node = min(remaining, key=lambda x: _selection_cost(work, x, method))
+        else:
+            node = next((v for v in order_hint if v in remaining), min(remaining))
         order.append(node)
         work, clique = _add_fill_edges(work, node)
         cliques.append(clique)
@@ -326,8 +375,8 @@ def triangulate(
 ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
     """Triangulate a moral graph and return adjacency, elimination order, cliques."""
     method = method.lower()
-    if method not in {"min-fill", "min-degree"}:
-        raise ValueError("method must be 'min-fill' or 'min-degree'")
+    if method not in {"min-fill", "min-degree", "mcs", "lexm"}:
+        raise ValueError("method must be 'min-fill', 'min-degree', 'mcs', or 'lexm'")
 
     work = np.asarray(moral_adjacency, dtype=int).copy()
     if work.shape[0] != work.shape[1]:

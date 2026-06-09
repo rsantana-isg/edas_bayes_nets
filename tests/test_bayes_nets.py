@@ -232,6 +232,13 @@ class TestStructureLearning:
         assert bn.adjacency.sum() > 0
         assert (bn.adjacency.sum(axis=0) <= 2).all()
 
+    def test_fit_recursive_parallel_causal_discovery(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="rpcd", max_parents=2, alpha=0.05)
+        assert bn.is_dag()
+        assert bn.adjacency.sum() > 0
+        assert (bn.adjacency.sum(axis=0) <= 2).all()
+
 
 # ---------------------------------------------------------------------------
 # Parameter learning
@@ -407,6 +414,25 @@ class TestFactorization:
         assert {0, 1, 2} in clique_sets
         assert {2, 3, 4} in clique_sets
 
+    @pytest.mark.parametrize("method", ["mcs", "lexm"])
+    def test_triangulate_supports_minimal_triangulation_approximations(self, method):
+        graph = np.array(
+            [
+                [0, 1, 0, 1],
+                [1, 0, 1, 0],
+                [0, 1, 0, 1],
+                [1, 0, 1, 0],
+            ],
+            dtype=int,
+        )
+        triangulated, order, cliques = triangulate(
+            graph, np.array([2, 2, 2, 2]), method=method
+        )
+        assert triangulated.shape == graph.shape
+        assert len(order) == 4
+        assert len(cliques) >= 1
+        assert np.all(np.diag(triangulated) == 0)
+
 
 class TestInference:
     def test_mpc_matches_bruteforce(self):
@@ -430,6 +456,19 @@ class TestInference:
         }
 
         configs, probs = bn.k_most_probable_configs(3)
+        assert configs.shape == (3, 2)
+        assert probs.shape == (3,)
+        assert np.all(probs[:-1] >= probs[1:])
+
+    def test_top_k_configs_with_astar_branch_and_bound(self):
+        bn = BayesianNetwork(n_vars=2, cardinality=np.array([2, 2]))
+        bn.adjacency[0, 1] = 1
+        bn.cpds = {
+            0: {"parents": [], "cpd": np.array([0.8, 0.2])},
+            1: {"parents": [0], "cpd": np.array([[0.9, 0.1], [0.2, 0.8]])},
+        }
+
+        configs, probs = bn.k_most_probable_configs(3, search_method="a_star_bb")
         assert configs.shape == (3, 2)
         assert probs.shape == (3,)
         assert np.all(probs[:-1] >= probs[1:])

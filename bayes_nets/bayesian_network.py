@@ -140,7 +140,7 @@ class BayesianNetwork:
         data : np.ndarray, shape (n_samples, n_vars)
             Observed discrete data.  Values must be integers in
             ``[0, cardinality[j])`` for each column j.
-        method : {"bic", "aic", "k2", "stable_hc", "tabu", "gs", "rcd"}
+        method : {"bic", "aic", "k2", "stable_hc", "tabu", "gs", "rcd", "rpcd"}
             Scoring / search algorithm.
         max_parents : int or None
             Maximum parents per variable.  ``None`` → rule of thumb
@@ -211,6 +211,7 @@ class BayesianNetwork:
             TabuHillClimbLearner,
             GrowShrinkLearner,
             RecursiveCDLearner,
+            RPCDLearner,
         )
         from bayes_nets.scoring import BICScoringMethod, AICScoringMethod
 
@@ -266,8 +267,13 @@ class BayesianNetwork:
                 interaction_matrix=interaction_matrix,
             )
 
-        elif method in ("gs", "rcd"):
-            learner_cls = GrowShrinkLearner if method == "gs" else RecursiveCDLearner
+        elif method in ("gs", "rcd", "rpcd"):
+            if method == "gs":
+                learner_cls = GrowShrinkLearner
+            elif method == "rcd":
+                learner_cls = RecursiveCDLearner
+            else:
+                learner_cls = RPCDLearner
             learner = learner_cls(
                 alpha_ci=alpha if alpha > 0 else 0.05,
                 max_parents=max_parents,
@@ -282,7 +288,7 @@ class BayesianNetwork:
         else:
             raise ValueError(
                 f"Unknown method '{method}'. "
-                "Choose 'bic', 'aic', 'k2', 'stable_hc', 'tabu', 'gs', or 'rcd'."
+                "Choose 'bic', 'aic', 'k2', 'stable_hc', 'tabu', 'gs', 'rcd', or 'rpcd'."
             )
 
         self.cpds = {}
@@ -539,11 +545,20 @@ class BayesianNetwork:
 
         return MaxProductInference(self).most_probable_config(evidence=evidence)
 
-    def k_most_probable_configs(self, k: int, evidence: Optional[Dict[int, int]] = None):
+    def k_most_probable_configs(
+        self,
+        k: int,
+        evidence: Optional[Dict[int, int]] = None,
+        search_method: str = "nilsson",
+    ):
         """Return top-k assignments sorted by decreasing probability."""
         from bayes_nets.inference import MaxProductInference
 
-        return MaxProductInference(self).k_most_probable_configs(k=k, evidence=evidence)
+        return MaxProductInference(self).k_most_probable_configs(
+            k=k,
+            evidence=evidence,
+            search_method=search_method,
+        )
 
     # ------------------------------------------------------------------
     # Representation

@@ -56,6 +56,7 @@ sample_weights : array of float, shape (n_samples,), optional
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from itertools import combinations
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -987,6 +988,157 @@ class RecursiveCDLearner:
                     if not independent:
                         skeleton[x, y] = 1
                         skeleton[y, x] = 1
+
+            comps = _connected_components(nodes)
+            if len(comps) > 1:
+                for comp in comps:
+                    _discover(comp)
+
+        _discover(list(range(n_vars)))
+
+        if permutation is None:
+            order = np.arange(n_vars, dtype=int)
+        else:
+            order = np.asarray(permutation, dtype=int)
+        pos = np.empty(n_vars, dtype=int)
+        for idx, var in enumerate(order):
+            pos[int(var)] = idx
+
+        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        for u in range(n_vars):
+            for v in range(u + 1, n_vars):
+                if skeleton[u, v] == 0:
+                    continue
+                if pos[u] < pos[v]:
+                    parent, child = u, v
+                else:
+                    parent, child = v, u
+                if np.sum(adjacency[:, child]) >= mp:
+                    continue
+                adjacency[parent, child] = 1
+
+        return adjacency
+
+
+class RPCDLearner:
+    """Learn a BN structure via recursive parallel causal discovery (RPCD-style)."""
+
+    def __init__(
+        self,
+        alpha_ci: float = 0.05,
+        max_parents: Optional[int] = None,
+        max_conditioning_set: int = 2,
+        max_workers: Optional[int] = None,
+        min_parallel_pairs: int = 8,
+        ci_test_timeout: float = 60.0,
+    ) -> None:
+        if max_conditioning_set < 0:
+            raise ValueError("max_conditioning_set must be >= 0")
+        self.alpha_ci = alpha_ci
+        self.max_parents = max_parents
+        self.max_conditioning_set = int(max_conditioning_set)
+        self.max_workers = max_workers
+        # Keep threshold at >=1 so sequential fallback is still available.
+        self.min_parallel_pairs = max(1, int(min_parallel_pairs))
+        self.ci_test_timeout = float(ci_test_timeout)
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        data = np.asarray(data, dtype=int)
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+
+        if sample_weights is None:
+            weights = np.ones(data.shape[0], dtype=float)
+        else:
+            weights = np.asarray(sample_weights, dtype=float)
+            total_w = float(np.sum(weights))
+            if total_w > 0:
+                weights = weights * (len(weights) / total_w)
+
+        skeleton = np.zeros((n_vars, n_vars), dtype=int)
+
+        def _is_dependent(x: int, y: int, nodes: List[int]) -> bool:
+            candidates = [z for z in nodes if z != x and z != y]
+            max_k = min(self.max_conditioning_set, len(candidates))
+            for k in range(max_k + 1):
+                for cond in combinations(candidates, k):
+                    independent = _chi_square_conditional_independence(
+                        data, x, y, list(cond), cardinality, self.alpha_ci, weights
+                    )
+                    if independent:
+                        return False
+            return True
+
+        def _connected_components(nodes: List[int]) -> List[List[int]]:
+            node_set = set(nodes)
+            seen: Set[int] = set()
+            comps: List[List[int]] = []
+            for start in sorted(nodes):
+                if start in seen:
+                    continue
+                stack = [start]
+                comp: List[int] = []
+                while stack:
+                    v = stack.pop()
+                    if v in seen:
+                        continue
+                    seen.add(v)
+                    comp.append(v)
+                    for nxt in np.where(skeleton[v] > 0)[0]:
+                        n_i = int(nxt)
+                        if n_i in node_set and n_i not in seen:
+                            stack.append(n_i)
+                comps.append(sorted(comp))
+            return comps
+
+        def _evaluate_pairs(nodes: List[int]) -> List[Tuple[int, int, bool]]:
+            pairs: List[Tuple[int, int]] = []
+            for i in range(len(nodes)):
+                x = int(nodes[i])
+                for j in range(i + 1, len(nodes)):
+                    y = int(nodes[j])
+                    if interaction_matrix is not None and interaction_matrix[x, y] == 0:
+                        continue
+                    pairs.append((x, y))
+
+            if len(pairs) < self.min_parallel_pairs:
+                return [(x, y, _is_dependent(x, y, nodes)) for x, y in pairs]
+
+            max_workers = self.max_workers
+            if max_workers is None:
+                max_workers = min(32, max(1, len(pairs)))
+            max_workers = max(1, int(max_workers))
+            if max_workers == 1:
+                return [(x, y, _is_dependent(x, y, nodes)) for x, y in pairs]
+
+            results: List[Tuple[int, int, bool]] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_is_dependent, x, y, nodes): (x, y) for x, y in pairs}
+                for future in as_completed(futures):
+                    x, y = futures[future]
+                    try:
+                        dependent = bool(future.result(timeout=self.ci_test_timeout))
+                    except TimeoutError:
+                        dependent = False
+                    results.append((x, y, dependent))
+            return results
+
+        def _discover(nodes: List[int]) -> None:
+            if len(nodes) <= 1:
+                return
+
+            for x, y, dependent in _evaluate_pairs(nodes):
+                if dependent:
+                    skeleton[x, y] = 1
+                    skeleton[y, x] = 1
 
             comps = _connected_components(nodes)
             if len(comps) > 1:
