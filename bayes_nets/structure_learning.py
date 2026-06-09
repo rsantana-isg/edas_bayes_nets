@@ -22,6 +22,10 @@ StableHillClimbLearner
 TabuHillClimbLearner
     HC-Stable extended with a tabu list (Kitson & Constantinou 2023).
 
+GrowShrinkLearner
+    Grow-Shrink Markov-blanket structure induction
+    (Margaritis & Thrun 1999).
+
 Common parameters
 -----------------
 permutation : array-like of int, optional
@@ -49,9 +53,10 @@ sample_weights : array of float, shape (n_samples,), optional
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+from scipy.stats import chi2 as chi2_dist
 
 from bayes_nets.scoring import ScoringMethod, K2ScoringMethod
 
@@ -698,3 +703,191 @@ class TabuHillClimbLearner:
                     break
 
         return best_adj
+
+
+# ---------------------------------------------------------------------------
+# Grow-Shrink (Margaritis & Thrun 1999)
+# ---------------------------------------------------------------------------
+
+
+def _weighted_contingency(
+    x: np.ndarray,
+    y: np.ndarray,
+    card_x: int,
+    card_y: int,
+    weights: np.ndarray,
+) -> np.ndarray:
+    """Build a weighted X-by-Y contingency table."""
+    table = np.zeros((card_x, card_y), dtype=float)
+    np.add.at(table, (x, y), weights)
+    return table
+
+
+def _chi_square_conditional_independence(
+    data: np.ndarray,
+    x: int,
+    y: int,
+    cond: List[int],
+    cardinality: np.ndarray,
+    alpha: float,
+    weights: np.ndarray,
+) -> bool:
+    """Return True when X ⟂ Y | cond under a stratified chi-square test."""
+    card_x = int(cardinality[x])
+    card_y = int(cardinality[y])
+
+    total_stat = 0.0
+    total_dof = 0
+
+    if len(cond) == 0:
+        table = _weighted_contingency(data[:, x], data[:, y], card_x, card_y, weights)
+        row_sum = table.sum(axis=1, keepdims=True)
+        col_sum = table.sum(axis=0, keepdims=True)
+        n = table.sum()
+        if n <= 0:
+            return True
+        expected = (row_sum @ col_sum) / n
+        valid = expected > 0
+        if not np.any(valid):
+            return True
+        total_stat = float(np.sum(((table - expected) ** 2 / expected)[valid]))
+        total_dof = (card_x - 1) * (card_y - 1)
+        if total_dof <= 0:
+            return True
+        p_value = float(chi2_dist.sf(total_stat, total_dof))
+        return p_value > alpha
+
+    mult = 1
+    cond_idx = np.zeros(data.shape[0], dtype=int)
+    for var in cond:
+        cond_idx += data[:, var] * mult
+        mult *= int(cardinality[var])
+
+    for cfg in range(mult):
+        mask = cond_idx == cfg
+        if not np.any(mask):
+            continue
+        table = _weighted_contingency(
+            data[mask, x],
+            data[mask, y],
+            card_x,
+            card_y,
+            weights[mask],
+        )
+        n = table.sum()
+        if n <= 0:
+            continue
+        row_sum = table.sum(axis=1, keepdims=True)
+        col_sum = table.sum(axis=0, keepdims=True)
+        expected = (row_sum @ col_sum) / n
+        valid = expected > 0
+        active_rows = int(np.sum(row_sum[:, 0] > 0))
+        active_cols = int(np.sum(col_sum[0, :] > 0))
+        dof = (active_rows - 1) * (active_cols - 1)
+        if dof <= 0 or not np.any(valid):
+            continue
+        total_stat += float(np.sum(((table - expected) ** 2 / expected)[valid]))
+        total_dof += dof
+
+    if total_dof <= 0:
+        return True
+    p_value = float(chi2_dist.sf(total_stat, total_dof))
+    return p_value > alpha
+
+
+class GrowShrinkLearner:
+    """Learn a BN structure via Grow-Shrink Markov-blanket induction."""
+
+    def __init__(
+        self,
+        alpha_ci: float = 0.05,
+        max_parents: Optional[int] = None,
+    ) -> None:
+        self.alpha_ci = alpha_ci
+        self.max_parents = max_parents
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        data = np.asarray(data, dtype=int)
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+
+        if sample_weights is None:
+            weights = np.ones(data.shape[0], dtype=float)
+        else:
+            weights = np.asarray(sample_weights, dtype=float)
+            total_w = float(np.sum(weights))
+            if total_w > 0:
+                weights = weights * (len(weights) / total_w)
+
+        markov_blankets: List[Set[int]] = [set() for _ in range(n_vars)]
+
+        for target in range(n_vars):
+            blanket: Set[int] = set()
+            changed = True
+            while changed:
+                changed = False
+                for var in range(n_vars):
+                    if var == target or var in blanket:
+                        continue
+                    if interaction_matrix is not None and interaction_matrix[var, target] == 0:
+                        continue
+                    cond = sorted(blanket)
+                    independent = _chi_square_conditional_independence(
+                        data, target, var, cond, cardinality, self.alpha_ci, weights
+                    )
+                    if not independent:
+                        blanket.add(var)
+                        changed = True
+
+            for var in sorted(blanket):
+                cond = sorted(list(blanket - {var}))
+                independent = _chi_square_conditional_independence(
+                    data, target, var, cond, cardinality, self.alpha_ci, weights
+                )
+                if independent:
+                    blanket.remove(var)
+
+            markov_blankets[target] = blanket
+
+        skeleton = np.zeros((n_vars, n_vars), dtype=int)
+        for u in range(n_vars):
+            for v in range(u + 1, n_vars):
+                if v in markov_blankets[u] and u in markov_blankets[v]:
+                    skeleton[u, v] = 1
+                    skeleton[v, u] = 1
+
+        if permutation is None:
+            order = np.arange(n_vars, dtype=int)
+        else:
+            order = np.asarray(permutation, dtype=int)
+        pos = np.empty(n_vars, dtype=int)
+        for idx, var in enumerate(order):
+            pos[int(var)] = idx
+
+        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+
+        for u in range(n_vars):
+            for v in range(u + 1, n_vars):
+                if skeleton[u, v] == 0:
+                    continue
+                if interaction_matrix is not None and interaction_matrix[u, v] == 0:
+                    continue
+
+                if pos[u] < pos[v]:
+                    parent, child = u, v
+                else:
+                    parent, child = v, u
+
+                if np.sum(adjacency[:, child]) >= mp:
+                    continue
+                adjacency[parent, child] = 1
+
+        return adjacency
