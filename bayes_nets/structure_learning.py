@@ -26,6 +26,9 @@ GrowShrinkLearner
     Grow-Shrink Markov-blanket structure induction
     (Margaritis & Thrun 1999).
 
+RecursiveCDLearner
+    Recursive causal discovery with conditional-independence tests.
+
 Common parameters
 -----------------
 permutation : array-like of int, optional
@@ -53,6 +56,7 @@ sample_weights : array of float, shape (n_samples,), optional
 
 from __future__ import annotations
 
+from itertools import combinations
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -886,6 +890,128 @@ class GrowShrinkLearner:
                 else:
                     parent, child = v, u
 
+                if np.sum(adjacency[:, child]) >= mp:
+                    continue
+                adjacency[parent, child] = 1
+
+        return adjacency
+
+
+class RecursiveCDLearner:
+    """Learn a BN structure via recursive causal discovery (RCD-style)."""
+
+    def __init__(
+        self,
+        alpha_ci: float = 0.05,
+        max_parents: Optional[int] = None,
+        max_conditioning_set: int = 2,
+    ) -> None:
+        self.alpha_ci = alpha_ci
+        self.max_parents = max_parents
+        self.max_conditioning_set = max(0, int(max_conditioning_set))
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        data = np.asarray(data, dtype=int)
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+
+        if sample_weights is None:
+            weights = np.ones(data.shape[0], dtype=float)
+        else:
+            weights = np.asarray(sample_weights, dtype=float)
+            total_w = float(np.sum(weights))
+            if total_w > 0:
+                weights = weights * (len(weights) / total_w)
+
+        skeleton = np.zeros((n_vars, n_vars), dtype=int)
+
+        def _is_independent(x: int, y: int, cond: List[int]) -> bool:
+            return _chi_square_conditional_independence(
+                data, x, y, cond, cardinality, self.alpha_ci, weights
+            )
+
+        def _connected_components(nodes: List[int]) -> List[List[int]]:
+            node_set = set(nodes)
+            seen: Set[int] = set()
+            comps: List[List[int]] = []
+
+            for start in sorted(nodes):
+                if start in seen:
+                    continue
+                stack = [start]
+                comp: List[int] = []
+                while stack:
+                    v = stack.pop()
+                    if v in seen:
+                        continue
+                    seen.add(v)
+                    comp.append(v)
+                    neigh = np.where(skeleton[v] > 0)[0]
+                    for nxt in neigh:
+                        n_i = int(nxt)
+                        if n_i in node_set and n_i not in seen:
+                            stack.append(n_i)
+                comps.append(sorted(comp))
+            return comps
+
+        def _discover(nodes: List[int]) -> None:
+            if len(nodes) <= 1:
+                return
+
+            for i in range(len(nodes)):
+                x = int(nodes[i])
+                for j in range(i + 1, len(nodes)):
+                    y = int(nodes[j])
+                    if interaction_matrix is not None and interaction_matrix[x, y] == 0:
+                        continue
+
+                    candidates = [z for z in nodes if z != x and z != y]
+                    max_k = min(self.max_conditioning_set, len(candidates))
+                    independent = False
+                    for k in range(max_k + 1):
+                        for cond in combinations(candidates, k):
+                            if _is_independent(x, y, list(cond)):
+                                independent = True
+                                break
+                        if independent:
+                            break
+
+                    if not independent:
+                        skeleton[x, y] = 1
+                        skeleton[y, x] = 1
+
+            comps = _connected_components(nodes)
+            if len(comps) > 1:
+                for comp in comps:
+                    _discover(comp)
+
+        _discover(list(range(n_vars)))
+
+        if permutation is None:
+            order = np.arange(n_vars, dtype=int)
+        else:
+            order = np.asarray(permutation, dtype=int)
+        pos = np.empty(n_vars, dtype=int)
+        for idx, var in enumerate(order):
+            pos[int(var)] = idx
+
+        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        for u in range(n_vars):
+            for v in range(u + 1, n_vars):
+                if skeleton[u, v] == 0:
+                    continue
+                if pos[u] < pos[v]:
+                    parent, child = u, v
+                else:
+                    parent, child = v, u
                 if np.sum(adjacency[:, child]) >= mp:
                     continue
                 adjacency[parent, child] = 1

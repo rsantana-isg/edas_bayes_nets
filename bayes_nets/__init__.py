@@ -14,6 +14,7 @@ from bayes_nets.structure_learning import (
     StableHillClimbLearner,
     TabuHillClimbLearner,
     GrowShrinkLearner,
+    RecursiveCDLearner,
 )
 from bayes_nets.parameter_learning import MLEParameterLearner
 from bayes_nets.sampling import ProbabilisticLogicSampler
@@ -35,6 +36,7 @@ __all__ = [
     "StableHillClimbLearner",
     "TabuHillClimbLearner",
     "GrowShrinkLearner",
+    "RecursiveCDLearner",
     "MLEParameterLearner",
     "ProbabilisticLogicSampler",
     "CliqueFactorization",

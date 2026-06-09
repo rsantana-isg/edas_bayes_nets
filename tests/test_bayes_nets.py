@@ -16,6 +16,7 @@ from bayes_nets import (
     moralize,
     triangulate,
     junction_tree,
+    MaxProductInference,
 )
 
 
@@ -224,6 +225,13 @@ class TestStructureLearning:
         assert bn.adjacency.sum() > 0
         assert (bn.adjacency.sum(axis=0) <= 2).all()
 
+    def test_fit_recursive_causal_discovery(self, simple_data, binary_cardinality):
+        bn = BayesianNetwork(n_vars=4, cardinality=binary_cardinality)
+        bn.fit(simple_data, method="rcd", max_parents=2, alpha=0.05)
+        assert bn.is_dag()
+        assert bn.adjacency.sum() > 0
+        assert (bn.adjacency.sum(axis=0) <= 2).all()
+
 
 # ---------------------------------------------------------------------------
 # Parameter learning
@@ -425,3 +433,34 @@ class TestInference:
         assert configs.shape == (3, 2)
         assert probs.shape == (3,)
         assert np.all(probs[:-1] >= probs[1:])
+
+    def test_loopy_map_respects_evidence(self):
+        bn = BayesianNetwork(n_vars=2, cardinality=np.array([2, 2]))
+        bn.adjacency[0, 1] = 1
+        bn.cpds = {
+            0: {"parents": [], "cpd": np.array([0.8, 0.2])},
+            1: {"parents": [0], "cpd": np.array([[0.9, 0.1], [0.2, 0.8]])},
+        }
+
+        infer = MaxProductInference(bn, loopy_treewidth_threshold=0, loopy_max_iter=50)
+        conf, prob = infer.most_probable_config(evidence={0: 1})
+
+        assert conf[0] == 1
+        assert prob > 0.0
+
+    def test_loopy_top_k_is_sorted_and_unique(self):
+        bn = BayesianNetwork(n_vars=2, cardinality=np.array([2, 2]))
+        bn.adjacency[0, 1] = 1
+        bn.cpds = {
+            0: {"parents": [], "cpd": np.array([0.8, 0.2])},
+            1: {"parents": [0], "cpd": np.array([[0.9, 0.1], [0.2, 0.8]])},
+        }
+
+        infer = MaxProductInference(bn, loopy_treewidth_threshold=0, loopy_max_iter=50)
+        configs, probs = infer.k_most_probable_configs(3)
+
+        assert configs.shape == (3, 2)
+        assert probs.shape == (3,)
+        assert np.all(probs[:-1] >= probs[1:])
+        unique_configs = {tuple(c.tolist()) for c in configs}
+        assert len(unique_configs) == len(configs)
