@@ -207,6 +207,7 @@ class MaxProductInference:
         self,
         k: int,
         evidence: Optional[Dict[int, int] | Iterable[Tuple[int, int]]] = None,
+        search_method: str = "nilsson",
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return the *k* most probable assignments (Nilsson 1998).
 
@@ -228,6 +229,21 @@ class MaxProductInference:
             raise ValueError("k must be >= 1")
 
         ev = self._normalize_evidence(evidence)
+        method = str(search_method).lower()
+        if method in {"nilsson", "lawler", "ve"}:
+            return self._k_most_nilsson(k=k, ev=ev)
+        if method in {"a_star_bb", "astar_bb", "astar", "branch_and_bound", "flerova"}:
+            return self._k_most_astar_branch_and_bound(k=k, ev=ev)
+        raise ValueError(
+            "search_method must be one of: "
+            "'nilsson', 'a_star_bb', 'astar', 'branch_and_bound', or 'flerova'"
+        )
+
+    def _k_most_nilsson(
+        self,
+        k: int,
+        ev: Dict[int, int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
         bn = self.bn
 
         map_solver = self._loopy_map if self._should_use_loopy() else self._ve_map
@@ -293,6 +309,68 @@ class MaxProductInference:
                     push(branch_assign, branch_prob, branch_ev, j)
 
         return np.array(result_assigns), np.array(result_probs)
+
+    def _k_most_astar_branch_and_bound(
+        self,
+        k: int,
+        ev: Dict[int, int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """A*/branch-and-bound over partial assignments using MAP bounds."""
+        bn = self.bn
+        topo = list(bn._topological_sort())
+        map_solver = self._loopy_map if self._should_use_loopy() else self._ve_map
+
+        heap: List[Tuple[float, int, Dict[int, int]]] = []
+        counter = 0
+        _, root_prob = map_solver(ev)
+        if root_prob <= 0.0:
+            return np.empty((0, bn.n_vars), dtype=int), np.empty(0, dtype=float)
+        heapq.heappush(heap, (-float(root_prob), counter, dict(ev)))
+        counter += 1
+
+        results: List[Tuple[np.ndarray, float]] = []
+        kth_bound = -np.inf
+
+        while heap:
+            neg_bound, _, partial = heapq.heappop(heap)
+            bound = -neg_bound
+            if len(results) >= k and bound <= kth_bound:
+                continue
+
+            unassigned = [v for v in topo if v not in partial]
+            if not unassigned:
+                assign = np.zeros(bn.n_vars, dtype=int)
+                for var, val in partial.items():
+                    assign[var] = int(val)
+                prob = self._joint_prob(assign)
+                results.append((assign, prob))
+                results.sort(key=lambda x: x[1], reverse=True)
+                if len(results) > k:
+                    results = results[:k]
+                if len(results) >= k:
+                    kth_bound = results[k - 1][1]
+                continue
+
+            split_var = int(unassigned[0])
+            for value in range(int(bn.cardinality[split_var])):
+                child = dict(partial)
+                child[split_var] = value
+                _, child_bound = map_solver(child)
+                if child_bound <= 0.0:
+                    continue
+                if len(results) >= k and child_bound <= kth_bound:
+                    continue
+                heapq.heappush(heap, (-float(child_bound), counter, child))
+                counter += 1
+
+        if not results:
+            return np.empty((0, bn.n_vars), dtype=int), np.empty(0, dtype=float)
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        top = results[:k]
+        assignments = np.array([item[0] for item in top], dtype=int)
+        probabilities = np.array([item[1] for item in top], dtype=float)
+        return assignments, probabilities
 
     def marginals(
         self,
