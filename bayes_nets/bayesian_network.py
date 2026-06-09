@@ -140,8 +140,11 @@ class BayesianNetwork:
         data : np.ndarray, shape (n_samples, n_vars)
             Observed discrete data.  Values must be integers in
             ``[0, cardinality[j])`` for each column j.
-        method : {"bic", "aic", "k2", "stable_hc", "tabu", "gs", "rcd", "rpcd"}
-            Scoring / search algorithm.
+        method : str
+            Scoring / search algorithm.  Choices: ``"bic"``, ``"aic"``,
+            ``"k2"``, ``"stable_hc"``, ``"tabu"``, ``"gs"``, ``"rcd"``,
+            ``"rpcd"``, ``"pc"``, ``"stable_pc"``, ``"dt"``/
+            ``"decision_tree"``, ``"dg"``/``"decision_graph"``.
         max_parents : int or None
             Maximum parents per variable.  ``None`` → rule of thumb
             ``max(1, floor(10·log2/log(max_cardinality)))``
@@ -268,15 +271,59 @@ class BayesianNetwork:
             )
 
         elif method in ("gs", "rcd", "rpcd"):
+            alpha_ci = alpha if 0 < alpha < 1 else 0.05
             if method == "gs":
-                learner_cls = GrowShrinkLearner
-            elif method == "rcd":
-                learner_cls = RecursiveCDLearner
+                learner = GrowShrinkLearner(
+                    alpha_ci=alpha_ci,
+                    max_parents=max_parents,
+                    # Default cap: prevents O(n²) blow-up on dense/large graphs
+                    max_conditioning_set_size=5,
+                )
             else:
-                learner_cls = RPCDLearner
-            learner = learner_cls(
-                alpha_ci=alpha if alpha > 0 else 0.05,
+                learner_cls = RecursiveCDLearner if method == "rcd" else RPCDLearner
+                learner = learner_cls(
+                    alpha_ci=alpha_ci,
+                    max_parents=max_parents,
+                )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method in ("pc", "stable_pc"):
+            from bayes_nets.structure_learning import PCLearner, StablePCLearner
+            cls_pc = PCLearner if method == "pc" else StablePCLearner
+            learner = cls_pc(
+                alpha_ci=alpha if 0 < alpha < 1 else 0.05,
                 max_parents=max_parents,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method in ("dt", "decision_tree"):
+            from bayes_nets.structure_learning import DecisionTreeLearner
+            learner = DecisionTreeLearner(
+                max_parents=max_parents,
+                alpha=alpha,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method in ("dg", "decision_graph"):
+            from bayes_nets.structure_learning import DecisionGraphLearner
+            learner = DecisionGraphLearner(
+                max_parents=max_parents,
+                alpha=alpha,
             )
             self.adjacency = learner.learn(
                 data, self.n_vars, self.cardinality,
@@ -288,7 +335,9 @@ class BayesianNetwork:
         else:
             raise ValueError(
                 f"Unknown method '{method}'. "
-                "Choose 'bic', 'aic', 'k2', 'stable_hc', 'tabu', 'gs', 'rcd', or 'rpcd'."
+                "Choose 'bic', 'aic', 'k2', 'stable_hc', 'tabu', "
+                "'gs', 'rcd', 'rpcd', 'pc', 'stable_pc', "
+                "'dt'/'decision_tree', or 'dg'/'decision_graph'."
             )
 
         self.cpds = {}

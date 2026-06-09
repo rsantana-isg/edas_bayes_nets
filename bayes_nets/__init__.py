@@ -7,7 +7,13 @@ but fully usable as a standalone library.
 """
 
 from bayes_nets.bayesian_network import BayesianNetwork
-from bayes_nets.scoring import BICScoringMethod, AICScoringMethod, K2ScoringMethod
+from bayes_nets.scoring import (
+    BICScoringMethod,
+    AICScoringMethod,
+    K2ScoringMethod,
+    DecisionTreeMDLScorer,
+    DecisionGraphBayesianScorer,
+)
 from bayes_nets.structure_learning import (
     K2StructureLearner,
     GreedyHillClimbLearner,
@@ -16,6 +22,10 @@ from bayes_nets.structure_learning import (
     GrowShrinkLearner,
     RecursiveCDLearner,
     RPCDLearner,
+    PCLearner,
+    StablePCLearner,
+    DecisionTreeLearner,
+    DecisionGraphLearner,
 )
 from bayes_nets.parameter_learning import MLEParameterLearner
 from bayes_nets.sampling import ProbabilisticLogicSampler
@@ -32,6 +42,8 @@ __all__ = [
     "BICScoringMethod",
     "AICScoringMethod",
     "K2ScoringMethod",
+    "DecisionTreeMDLScorer",
+    "DecisionGraphBayesianScorer",
     "K2StructureLearner",
     "GreedyHillClimbLearner",
     "StableHillClimbLearner",
@@ -39,6 +51,10 @@ __all__ = [
     "GrowShrinkLearner",
     "RecursiveCDLearner",
     "RPCDLearner",
+    "PCLearner",
+    "StablePCLearner",
+    "DecisionTreeLearner",
+    "DecisionGraphLearner",
     "MLEParameterLearner",
     "ProbabilisticLogicSampler",
     "CliqueFactorization",

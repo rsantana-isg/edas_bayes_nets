@@ -19,6 +19,11 @@ Prints a per-BN table and an aggregated summary.
 Saves all results to <data_dir>/comparison_results.csv.
 
 Adding a new method: add one dict to LEARNING_METHODS only.
+
+Methods implemented:
+  Score-based   : K2, BIC-HC, AIC-HC, HC-Stable, Tabu
+  Local-structure: DT (decision-tree MDL), DG (decision-graph Bayesian)
+  Constraint-based: GS, RCD, RPCD, PC, Stable-PC
 """
 
 import sys
@@ -44,14 +49,24 @@ from bayes_nets import BayesianNetwork  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Learning methods registry
-# Adding a new method: append a dict here.
+# Adding a new method: append one dict here — nothing else to change.
 # ---------------------------------------------------------------------------
 LEARNING_METHODS = [
-    dict(name="K2",        method="k2",        kwargs={}),
-    dict(name="BIC-HC",    method="bic",        kwargs={}),
-    dict(name="AIC-HC",    method="aic",        kwargs={}),
-    dict(name="HC-Stable", method="stable_hc",  kwargs={}),
-    dict(name="Tabu",      method="tabu",       kwargs={}),
+    # ── Score-based (tabular CPDs) ─────────────────────────────────────
+    dict(name="K2",         method="k2",         kwargs={}),
+    dict(name="BIC-HC",     method="bic",         kwargs={}),
+    dict(name="AIC-HC",     method="aic",         kwargs={}),
+    dict(name="HC-Stable",  method="stable_hc",   kwargs={}),
+    dict(name="Tabu",       method="tabu",        kwargs={}),
+    # ── Local-structure CPD scoring ────────────────────────────────────
+    dict(name="DT-MDL",     method="dt",          kwargs={}),
+    dict(name="DG-Bayes",   method="dg",          kwargs={}),
+    # ── Constraint-based ───────────────────────────────────────────────
+    dict(name="GS",         method="gs",          kwargs={}),
+    dict(name="RCD",        method="rcd",         kwargs={}),
+    dict(name="RPCD",       method="rpcd",        kwargs={}),
+    dict(name="PC",         method="pc",          kwargs={}),
+    dict(name="Stable-PC",  method="stable_pc",   kwargs={}),
 ]
 
 # The 10 benchmarks (same list as generate_bn_datasets.py)

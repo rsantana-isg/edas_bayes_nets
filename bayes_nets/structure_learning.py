@@ -29,6 +29,25 @@ GrowShrinkLearner
 RecursiveCDLearner
     Recursive causal discovery with conditional-independence tests.
 
+PCLearner
+    PC algorithm for constraint-based skeleton + orientation
+    (Spirtes & Glymour 1991).
+
+StablePCLearner
+    Order-independent (Stable-PC) variant: all CI tests at a given
+    conditioning-set size are collected before any edge is removed,
+    eliminating the dependence on variable ordering.
+
+DecisionTreeLearner
+    HC structure search scored with a decision-tree MDL metric.
+    Local structure in CPDs is captured by growing a CART-BIC tree
+    over parent variables (Friedman & Goldszmidt 1996).
+
+DecisionGraphLearner
+    HC structure search scored with a decision-graph Bayesian metric.
+    Extends decision trees with a leaf-merging step that detects and
+    exploits parameter equalities (Chickering, Heckerman & Meek 1997).
+
 Common parameters
 -----------------
 permutation : array-like of int, optional
@@ -755,7 +774,8 @@ def _chi_square_conditional_independence(
         valid = expected > 0
         if not np.any(valid):
             return True
-        total_stat = float(np.sum(((table - expected) ** 2 / expected)[valid]))
+        safe_exp = np.where(valid, expected, 1.0)  # avoid div-by-zero outside valid
+        total_stat = float(np.sum(np.where(valid, (table - expected) ** 2 / safe_exp, 0.0)))
         total_dof = (card_x - 1) * (card_y - 1)
         if total_dof <= 0:
             return True
@@ -791,7 +811,8 @@ def _chi_square_conditional_independence(
         dof = (active_rows - 1) * (active_cols - 1)
         if dof <= 0 or not np.any(valid):
             continue
-        total_stat += float(np.sum(((table - expected) ** 2 / expected)[valid]))
+        safe_exp = np.where(valid, expected, 1.0)
+        total_stat += float(np.sum(np.where(valid, (table - expected) ** 2 / safe_exp, 0.0)))
         total_dof += dof
 
     if total_dof <= 0:
@@ -801,15 +822,29 @@ def _chi_square_conditional_independence(
 
 
 class GrowShrinkLearner:
-    """Learn a BN structure via Grow-Shrink Markov-blanket induction."""
+    """Learn a BN structure via Grow-Shrink Markov-blanket induction.
+
+    Parameters
+    ----------
+    alpha_ci : float
+        Chi-square significance level.
+    max_parents : int or None
+    max_conditioning_set_size : int or None
+        Cap the size of the conditioning set used in CI tests.  Limits the
+        depth of the shrink phase and prevents the quadratic blow-up that
+        occurs on dense or high-cardinality networks.  ``None`` → full
+        blanket conditioning (original GS; can be slow on large networks).
+    """
 
     def __init__(
         self,
         alpha_ci: float = 0.05,
         max_parents: Optional[int] = None,
+        max_conditioning_set_size: Optional[int] = None,
     ) -> None:
         self.alpha_ci = alpha_ci
         self.max_parents = max_parents
+        self.max_conditioning_set_size = max_conditioning_set_size
 
     def learn(
         self,
@@ -832,6 +867,7 @@ class GrowShrinkLearner:
             if total_w > 0:
                 weights = weights * (len(weights) / total_w)
 
+        max_cond = self.max_conditioning_set_size
         markov_blankets: List[Set[int]] = [set() for _ in range(n_vars)]
 
         for target in range(n_vars):
@@ -845,6 +881,8 @@ class GrowShrinkLearner:
                     if interaction_matrix is not None and interaction_matrix[var, target] == 0:
                         continue
                     cond = sorted(blanket)
+                    if max_cond is not None:
+                        cond = cond[:max_cond]
                     independent = _chi_square_conditional_independence(
                         data, target, var, cond, cardinality, self.alpha_ci, weights
                     )
@@ -854,6 +892,8 @@ class GrowShrinkLearner:
 
             for var in sorted(blanket):
                 cond = sorted(list(blanket - {var}))
+                if max_cond is not None:
+                    cond = cond[:max_cond]
                 independent = _chi_square_conditional_independence(
                     data, target, var, cond, cardinality, self.alpha_ci, weights
                 )
@@ -1169,3 +1209,381 @@ class RPCDLearner:
                 adjacency[parent, child] = 1
 
         return adjacency
+
+
+# ---------------------------------------------------------------------------
+# PC algorithm shared orientation helpers
+# ---------------------------------------------------------------------------
+
+
+def _orient_v_structures(
+    n_vars: int,
+    skeleton: np.ndarray,
+    sep_sets: Dict[Tuple[int, int], List[int]],
+) -> np.ndarray:
+    """Orient colliders (v-structures): a -b- c with b not in sep(a,c) -> a->b<-c."""
+    directed = np.zeros((n_vars, n_vars), dtype=int)
+    for b in range(n_vars):
+        neighbors = [v for v in range(n_vars) if skeleton[b, v] == 1]
+        for ai in range(len(neighbors)):
+            a = neighbors[ai]
+            for c in neighbors[ai + 1:]:
+                if skeleton[a, c] == 1:
+                    continue  # shielded triple - skip
+                sep_ac = sep_sets.get((a, c), sep_sets.get((c, a)))
+                if sep_ac is not None and b not in sep_ac:
+                    directed[a, b] = 1
+                    directed[c, b] = 1
+    return directed
+
+
+def _apply_meek_rules(
+    n_vars: int,
+    skeleton: np.ndarray,
+    directed: np.ndarray,
+) -> np.ndarray:
+    """Propagate orientations with Meek's core rules R1, R2, R3."""
+    changed = True
+    while changed:
+        changed = False
+        for u in range(n_vars):
+            for v in range(n_vars):
+                if skeleton[u, v] == 0 or directed[u, v] == 1 or directed[v, u] == 1:
+                    continue
+                # R1: b->u and b not adj v  ->  u->v
+                for b in range(n_vars):
+                    if directed[b, u] == 1 and skeleton[b, v] == 0:
+                        directed[u, v] = 1; changed = True; break
+                if directed[u, v] == 1:
+                    continue
+                # R2: u->c->v  ->  u->v
+                for c in range(n_vars):
+                    if directed[u, c] == 1 and directed[c, v] == 1:
+                        directed[u, v] = 1; changed = True; break
+                if directed[u, v] == 1:
+                    continue
+                # R3: c->v, d->v, u-c, u-d, c not adj d  ->  u->v
+                parents_v = [p for p in range(n_vars) if directed[p, v] == 1]
+                for i_c, c in enumerate(parents_v):
+                    if skeleton[u, c] == 0:
+                        continue
+                    for d in parents_v[i_c + 1:]:
+                        if skeleton[u, d] == 0:
+                            continue
+                        if skeleton[c, d] == 0:
+                            directed[u, v] = 1; changed = True; break
+                    if directed[u, v] == 1:
+                        break
+    return directed
+
+
+def _skeleton_to_adjacency(
+    n_vars: int,
+    skeleton: np.ndarray,
+    directed: np.ndarray,
+    permutation: Optional[np.ndarray],
+    mp: int,
+) -> np.ndarray:
+    """Directed edges keep orientation; remaining use permutation order."""
+    if permutation is None:
+        order = np.arange(n_vars, dtype=int)
+    else:
+        order = np.asarray(permutation, dtype=int)
+    pos = np.empty(n_vars, dtype=int)
+    for idx, var in enumerate(order):
+        pos[int(var)] = idx
+
+    adjacency = np.zeros((n_vars, n_vars), dtype=int)
+    for u in range(n_vars):
+        for v in range(u + 1, n_vars):
+            if skeleton[u, v] == 0:
+                continue
+            if directed[u, v] == 1:
+                parent, child = u, v
+            elif directed[v, u] == 1:
+                parent, child = v, u
+            else:
+                parent, child = (u, v) if pos[u] < pos[v] else (v, u)
+            if np.sum(adjacency[:, child]) < mp:
+                adjacency[parent, child] = 1
+    return adjacency
+
+
+# ---------------------------------------------------------------------------
+# PC algorithm  (Spirtes & Glymour 1991)
+# ---------------------------------------------------------------------------
+
+
+class PCLearner:
+    """Learn BN structure using the PC algorithm.
+
+    Phase 1 -- Skeleton: for each adjacent pair (X,Y) test conditioning subsets
+    of adj(X) of increasing size d; remove edge on first separating set found.
+    Phase 2 -- V-structures: orient colliders from the recorded separating sets.
+    Phase 3 -- Meek rules R1-R3: propagate orientations to avoid cycles and
+    new v-structures.
+
+    Parameters
+    ----------
+    alpha_ci : float
+        Significance level for the chi-square CI test.
+    max_cond_set_size : int or None
+        Cap on conditioning set size.  None -> unbounded.
+    max_parents : int or None
+
+    References
+    ----------
+    Spirtes & Glymour (1991). "An Algorithm for Fast Recovery of Sparse
+    Causal Graphs." Social Science Computer Review 9(1).
+    """
+
+    def __init__(
+        self,
+        alpha_ci: float = 0.05,
+        max_cond_set_size: Optional[int] = None,
+        max_parents: Optional[int] = None,
+    ) -> None:
+        self.alpha_ci = alpha_ci
+        self.max_cond_set_size = max_cond_set_size
+        self.max_parents = max_parents
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        data = np.asarray(data, dtype=int)
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+        weights = self._make_weights(data.shape[0], sample_weights)
+        skeleton, sep_sets = self._find_skeleton(data, n_vars, cardinality, weights, interaction_matrix)
+        directed = _orient_v_structures(n_vars, skeleton, sep_sets)
+        directed = _apply_meek_rules(n_vars, skeleton, directed)
+        return _skeleton_to_adjacency(n_vars, skeleton, directed, permutation, mp)
+
+    def _make_weights(self, n: int, sw: Optional[np.ndarray]) -> np.ndarray:
+        if sw is None:
+            return np.ones(n, dtype=float)
+        w = np.asarray(sw, dtype=float)
+        total = float(w.sum())
+        return w * (n / total) if total > 0 else np.ones(n, dtype=float)
+
+    def _ci_test(self, data, x, y, cond, cardinality, weights):
+        return _chi_square_conditional_independence(
+            data, x, y, cond, cardinality, self.alpha_ci, weights
+        )
+
+    def _find_skeleton(self, data, n_vars, cardinality, weights, interaction_matrix):
+        adj: Dict[int, Set[int]] = {v: set(range(n_vars)) - {v} for v in range(n_vars)}
+        if interaction_matrix is not None:
+            for v in range(n_vars):
+                adj[v] = {u for u in adj[v] if interaction_matrix[u, v] != 0}
+
+        sep_sets: Dict[Tuple[int, int], List[int]] = {}
+        max_d = self.max_cond_set_size
+        d = 0
+        while True:
+            removed_any = False
+            for x in range(n_vars):
+                for y in sorted(adj[x]):
+                    if y <= x or (x, y) in sep_sets:
+                        continue
+                    candidates = sorted(adj[x] - {y})
+                    if len(candidates) < d:
+                        continue
+                    if max_d is not None and d > max_d:
+                        continue
+                    for cond in combinations(candidates, d):
+                        if self._ci_test(data, x, y, list(cond), cardinality, weights):
+                            adj[x].discard(y); adj[y].discard(x)
+                            sep_sets[(x, y)] = sep_sets[(y, x)] = list(cond)
+                            removed_any = True
+                            break
+            d += 1
+            if not removed_any or (max_d is not None and d > max_d):
+                break
+
+        skeleton = np.zeros((n_vars, n_vars), dtype=int)
+        for x in range(n_vars):
+            for y in adj[x]:
+                skeleton[x, y] = 1
+        return skeleton, sep_sets
+
+
+# ---------------------------------------------------------------------------
+# Stable-PC  (Colombo & Maathuis 2014)
+# ---------------------------------------------------------------------------
+
+
+class StablePCLearner(PCLearner):
+    """Order-independent PC algorithm.
+
+    At each level d, all CI tests are evaluated before any edge is removed,
+    making the skeleton independent of variable ordering.
+
+    References
+    ----------
+    Colombo & Maathuis (2014). "Order-Independent Constraint-Based Causal
+    Structure Learning." JMLR 15.
+    """
+
+    def _find_skeleton(self, data, n_vars, cardinality, weights, interaction_matrix):
+        adj: Dict[int, Set[int]] = {v: set(range(n_vars)) - {v} for v in range(n_vars)}
+        if interaction_matrix is not None:
+            for v in range(n_vars):
+                adj[v] = {u for u in adj[v] if interaction_matrix[u, v] != 0}
+
+        sep_sets: Dict[Tuple[int, int], List[int]] = {}
+        max_d = self.max_cond_set_size
+        d = 0
+        while True:
+            to_remove: List[Tuple[int, int, List[int]]] = []
+            for x in range(n_vars):
+                for y in sorted(adj[x]):
+                    if y <= x or (x, y) in sep_sets:
+                        continue
+                    candidates = sorted(adj[x] - {y})
+                    if len(candidates) < d:
+                        continue
+                    if max_d is not None and d > max_d:
+                        continue
+                    for cond in combinations(candidates, d):
+                        if self._ci_test(data, x, y, list(cond), cardinality, weights):
+                            to_remove.append((x, y, list(cond)))
+                            break
+
+            if not to_remove:
+                break
+            for x, y, cond in to_remove:
+                adj[x].discard(y); adj[y].discard(x)
+                if (x, y) not in sep_sets:
+                    sep_sets[(x, y)] = sep_sets[(y, x)] = cond
+            d += 1
+            if max_d is not None and d > max_d:
+                break
+
+        skeleton = np.zeros((n_vars, n_vars), dtype=int)
+        for x in range(n_vars):
+            for y in adj[x]:
+                skeleton[x, y] = 1
+        return skeleton, sep_sets
+
+
+# ---------------------------------------------------------------------------
+# Decision-tree HC learner  (Friedman & Goldszmidt 1996)
+# ---------------------------------------------------------------------------
+
+
+class DecisionTreeLearner:
+    """HC structure search with decision-tree MDL scoring for local CPD structure.
+
+    Uses DecisionTreeMDLScorer inside StableHillClimbLearner.  Each CPD is
+    compressed via a CART-BIC tree: splits are accepted only when the BIC
+    gain is positive.  Effective parameters = n_leaves*(k-1) <= tabular count.
+
+    References
+    ----------
+    Friedman & Goldszmidt (1996). "Learning Bayesian Networks with Local
+    Structure." UAI-96.
+    """
+
+    def __init__(
+        self,
+        max_parents: Optional[int] = None,
+        max_iter: int = 500,
+        limit_table_size: bool = True,
+        alpha: float = 1.0,
+        max_tree_depth: Optional[int] = None,
+    ) -> None:
+        self.max_parents = max_parents
+        self.max_iter = max_iter
+        self.limit_table_size = limit_table_size
+        self.alpha = alpha
+        self.max_tree_depth = max_tree_depth
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        from bayes_nets.scoring import DecisionTreeMDLScorer
+
+        scoring = DecisionTreeMDLScorer(
+            alpha=self.alpha,
+            sample_weights=sample_weights,
+            max_tree_depth=self.max_tree_depth,
+        )
+        return StableHillClimbLearner(
+            scoring=scoring,
+            max_parents=self.max_parents,
+            max_iter=self.max_iter,
+            limit_table_size=self.limit_table_size,
+        ).learn(data, n_vars, cardinality,
+                permutation=permutation, interaction_matrix=interaction_matrix)
+
+
+# ---------------------------------------------------------------------------
+# Decision-graph HC learner  (Chickering, Heckerman & Meek 1997)
+# ---------------------------------------------------------------------------
+
+
+class DecisionGraphLearner:
+    """HC structure search with decision-graph Bayesian scoring.
+
+    Uses DecisionGraphBayesianScorer inside StableHillClimbLearner.  After
+    growing a greedy K2 tree, pairs of leaves whose data is pooled by K2 are
+    merged (parameter sharing), the defining property of decision graphs.
+
+    References
+    ----------
+    Chickering, Heckerman & Meek (1997). "A Bayesian Approach to Learning
+    Bayesian Networks with Local Structure." UAI-97.
+    """
+
+    def __init__(
+        self,
+        max_parents: Optional[int] = None,
+        max_iter: int = 500,
+        limit_table_size: bool = True,
+        alpha: float = 1.0,
+        max_tree_depth: Optional[int] = None,
+    ) -> None:
+        self.max_parents = max_parents
+        self.max_iter = max_iter
+        self.limit_table_size = limit_table_size
+        self.alpha = alpha
+        self.max_tree_depth = max_tree_depth
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        from bayes_nets.scoring import DecisionGraphBayesianScorer
+
+        scoring = DecisionGraphBayesianScorer(
+            alpha=self.alpha,
+            sample_weights=sample_weights,
+            max_tree_depth=self.max_tree_depth,
+        )
+        return StableHillClimbLearner(
+            scoring=scoring,
+            max_parents=self.max_parents,
+            max_iter=self.max_iter,
+            limit_table_size=self.limit_table_size,
+        ).learn(data, n_vars, cardinality,
+                permutation=permutation, interaction_matrix=interaction_matrix)
