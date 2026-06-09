@@ -358,7 +358,7 @@ def _triangulate_block(
         if order_hint is None:
             node = min(remaining, key=lambda x: _selection_cost(work, x, method))
         else:
-            node = next(v for v in order_hint if v in remaining)
+            node = next((v for v in order_hint if v in remaining), min(remaining))
         order.append(node)
         work, clique = _add_fill_edges(work, node)
         cliques.append(clique)

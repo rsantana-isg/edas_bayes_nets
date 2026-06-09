@@ -238,7 +238,7 @@ class MaxProductInference:
             return self._k_most_astar_branch_and_bound(k=k, ev=ev)
         raise ValueError(
             "search_method must be one of: "
-            "'nilsson', 'a_star_bb', 'astar', 'branch_and_bound', or 'flerova'"
+            "'nilsson', 'a_star_bb', 'astar_bb', 'astar', 'branch_and_bound', or 'flerova'"
         )
 
     def _k_most_nilsson(
