@@ -140,7 +140,7 @@ class BayesianNetwork:
         data : np.ndarray, shape (n_samples, n_vars)
             Observed discrete data.  Values must be integers in
             ``[0, cardinality[j])`` for each column j.
-        method : {"bic", "aic", "k2", "stable_hc", "tabu", "gs"}
+        method : {"bic", "aic", "k2", "stable_hc", "tabu", "gs", "rcd"}
             Scoring / search algorithm.
         max_parents : int or None
             Maximum parents per variable.  ``None`` → rule of thumb
@@ -210,6 +210,7 @@ class BayesianNetwork:
             StableHillClimbLearner,
             TabuHillClimbLearner,
             GrowShrinkLearner,
+            RecursiveCDLearner,
         )
         from bayes_nets.scoring import BICScoringMethod, AICScoringMethod
 
@@ -265,8 +266,9 @@ class BayesianNetwork:
                 interaction_matrix=interaction_matrix,
             )
 
-        elif method == "gs":
-            learner = GrowShrinkLearner(
+        elif method in ("gs", "rcd"):
+            learner_cls = GrowShrinkLearner if method == "gs" else RecursiveCDLearner
+            learner = learner_cls(
                 alpha_ci=alpha if alpha > 0 else 0.05,
                 max_parents=max_parents,
             )
@@ -280,7 +282,7 @@ class BayesianNetwork:
         else:
             raise ValueError(
                 f"Unknown method '{method}'. "
-                "Choose 'bic', 'aic', 'k2', 'stable_hc', 'tabu', or 'gs'."
+                "Choose 'bic', 'aic', 'k2', 'stable_hc', 'tabu', 'gs', or 'rcd'."
             )
 
         self.cpds = {}

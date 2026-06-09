@@ -156,7 +156,14 @@ class MaxProductInference:
         ``bn.learn_parameters()`` first).
     """
 
-    def __init__(self, bn: BayesianNetwork) -> None:
+    def __init__(
+        self,
+        bn: BayesianNetwork,
+        loopy_treewidth_threshold: Optional[int] = 8,
+        loopy_max_iter: int = 100,
+        loopy_tol: float = 1e-6,
+        loopy_damping: float = 0.5,
+    ) -> None:
         if not bn.cpds:
             raise RuntimeError(
                 "CPDs are required for inference. "
@@ -164,6 +171,11 @@ class MaxProductInference:
             )
         self.bn = bn
         self._elim_order: Optional[List[int]] = None
+        self._treewidth_estimate: Optional[int] = None
+        self.loopy_treewidth_threshold = loopy_treewidth_threshold
+        self.loopy_max_iter = max(1, int(loopy_max_iter))
+        self.loopy_tol = float(loopy_tol)
+        self.loopy_damping = float(np.clip(loopy_damping, 0.0, 0.99))
 
     # ------------------------------------------------------------------
     # Public API
@@ -185,6 +197,8 @@ class MaxProductInference:
         probability : float
         """
         ev = self._normalize_evidence(evidence)
+        if self._should_use_loopy():
+            return self._loopy_map(ev)
         return self._ve_map(ev)
 
     def k_most_probable_configs(
@@ -214,7 +228,8 @@ class MaxProductInference:
         ev = self._normalize_evidence(evidence)
         bn = self.bn
 
-        map_assign, map_prob = self._ve_map(ev)
+        map_solver = self._loopy_map if self._should_use_loopy() else self._ve_map
+        map_assign, map_prob = map_solver(ev)
         result_assigns = [map_assign.copy()]
         result_probs = [map_prob]
 
@@ -247,7 +262,7 @@ class MaxProductInference:
                 if v == int(map_assign[split_var]):
                     continue
                 branch_ev = {**prefix, split_var: v}
-                branch_assign, branch_prob = self._ve_map(branch_ev)
+                branch_assign, branch_prob = map_solver(branch_ev)
                 push(branch_assign, branch_prob, branch_ev, i)
 
         # Expand until k configs collected
@@ -272,7 +287,7 @@ class MaxProductInference:
                     if v == int(assign[split_var]):
                         continue
                     branch_ev = {**new_ev, split_var: v}
-                    branch_assign, branch_prob = self._ve_map(branch_ev)
+                    branch_assign, branch_prob = map_solver(branch_ev)
                     push(branch_assign, branch_prob, branch_ev, j)
 
         return np.array(result_assigns), np.array(result_probs)
@@ -368,9 +383,20 @@ class MaxProductInference:
         if self._elim_order is None:
             from bayes_nets.factorization import moralize, triangulate
             moral = moralize(self.bn.adjacency)
-            _, order, _ = triangulate(moral, self.bn.cardinality, method="min-fill")
+            _, order, cliques = triangulate(moral, self.bn.cardinality, method="min-fill")
             self._elim_order = list(order)
+            self._treewidth_estimate = max((len(c) - 1 for c in cliques), default=0)
         return self._elim_order
+
+    def _estimated_treewidth(self) -> int:
+        if self._treewidth_estimate is None:
+            self._get_elim_order()
+        return int(self._treewidth_estimate or 0)
+
+    def _should_use_loopy(self) -> bool:
+        if self.loopy_treewidth_threshold is None:
+            return False
+        return self._estimated_treewidth() > int(self.loopy_treewidth_threshold)
 
     def _build_factors(self) -> List[Tuple[List[int], np.ndarray]]:
         factors = []
@@ -476,5 +502,107 @@ class MaxProductInference:
             else:
                 idx = tuple(int(assignment[v]) for v in argmax_scope)
                 assignment[var] = int(argmax_t[idx])
+
+        return assignment, self._joint_prob(assignment)
+
+    def _loopy_map(self, ev: Dict[int, int]) -> Tuple[np.ndarray, float]:
+        """Approximate MAP by damped max-product loopy belief propagation."""
+        bn = self.bn
+        factors = self._build_factors()
+
+        var_to_factors: List[List[int]] = [[] for _ in range(bn.n_vars)]
+        for f_idx, (scope, _) in enumerate(factors):
+            for v in scope:
+                var_to_factors[v].append(f_idx)
+
+        msg_vf: Dict[Tuple[int, int], np.ndarray] = {}
+        msg_fv: Dict[Tuple[int, int], np.ndarray] = {}
+
+        for var in range(bn.n_vars):
+            card = int(bn.cardinality[var])
+            init = np.ones(card, dtype=float) / card
+            if var in ev:
+                init = np.zeros(card, dtype=float)
+                init[ev[var]] = 1.0
+            for f_idx in var_to_factors[var]:
+                msg_vf[(var, f_idx)] = init.copy()
+                msg_fv[(f_idx, var)] = init.copy()
+
+        for _ in range(self.loopy_max_iter):
+            max_delta = 0.0
+
+            new_fv: Dict[Tuple[int, int], np.ndarray] = {}
+            for f_idx, (scope, table) in enumerate(factors):
+                table_arr = np.asarray(table, dtype=float)
+                for target_pos, var in enumerate(scope):
+                    msg = table_arr
+                    for pos, other_var in enumerate(scope):
+                        if pos == target_pos:
+                            continue
+                        incoming = msg_vf[(other_var, f_idx)]
+                        shape = [1] * msg.ndim
+                        shape[pos] = int(bn.cardinality[other_var])
+                        msg = msg * incoming.reshape(shape)
+
+                    axes = tuple(i for i in range(msg.ndim) if i != target_pos)
+                    out = msg if len(axes) == 0 else np.max(msg, axis=axes)
+                    out = np.asarray(out, dtype=float)
+
+                    if var in ev:
+                        forced = np.zeros(int(bn.cardinality[var]), dtype=float)
+                        forced[ev[var]] = 1.0
+                        out = forced
+                    else:
+                        m = float(np.max(out))
+                        if not np.isfinite(m) or m <= 0.0:
+                            out = np.ones(int(bn.cardinality[var]), dtype=float) / int(bn.cardinality[var])
+                        else:
+                            out = out / m
+
+                    old = msg_fv[(f_idx, var)]
+                    damped = self.loopy_damping * old + (1.0 - self.loopy_damping) * out
+                    max_delta = max(max_delta, float(np.max(np.abs(damped - old))))
+                    new_fv[(f_idx, var)] = damped
+
+            new_vf: Dict[Tuple[int, int], np.ndarray] = {}
+            for var in range(bn.n_vars):
+                card = int(bn.cardinality[var])
+                for f_idx in var_to_factors[var]:
+                    if var in ev:
+                        out = np.zeros(card, dtype=float)
+                        out[ev[var]] = 1.0
+                    else:
+                        out = np.ones(card, dtype=float)
+                        for other_f in var_to_factors[var]:
+                            if other_f == f_idx:
+                                continue
+                            out *= new_fv[(other_f, var)]
+                        m = float(np.max(out))
+                        if not np.isfinite(m) or m <= 0.0:
+                            out = np.ones(card, dtype=float) / card
+                        else:
+                            out = out / m
+
+                    old = msg_vf[(var, f_idx)]
+                    damped = self.loopy_damping * old + (1.0 - self.loopy_damping) * out
+                    max_delta = max(max_delta, float(np.max(np.abs(damped - old))))
+                    new_vf[(var, f_idx)] = damped
+
+            msg_fv = new_fv
+            msg_vf = new_vf
+
+            if max_delta < self.loopy_tol:
+                break
+
+        assignment = np.zeros(bn.n_vars, dtype=int)
+        for var in range(bn.n_vars):
+            if var in ev:
+                assignment[var] = ev[var]
+                continue
+            card = int(bn.cardinality[var])
+            belief = np.ones(card, dtype=float)
+            for f_idx in var_to_factors[var]:
+                belief *= msg_fv[(f_idx, var)]
+            assignment[var] = int(np.argmax(belief))
 
         return assignment, self._joint_prob(assignment)
