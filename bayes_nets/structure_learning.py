@@ -284,6 +284,204 @@ class K2StructureLearner:
 
 
 # ---------------------------------------------------------------------------
+# DMBBN algorithm (Dâmaso et al. 2026)
+# ---------------------------------------------------------------------------
+
+
+class DMBBNStructureLearner:
+    """Learn a BN structure using the DMBBN algorithm.
+
+    DMBBN (Dynamic Markov Blanket Bayesian Network) induces local structures
+    for each variable independently using a Markov-blanket heuristic, then
+    combines them into a global DAG using an adapted Kruskal's algorithm
+    (Dâmaso et al. 2026).
+
+    Parameters
+    ----------
+    max_parents : int or None
+        Maximum parents per variable.  ``None`` → rule of thumb.
+    alpha : float
+        Prior equivalent sample size for the K2 score.
+    limit_table_size : bool
+        Skip candidate parent sets whose joint table would exceed the
+        number of training samples.
+    """
+
+    def __init__(
+        self,
+        max_parents: Optional[int] = None,
+        alpha: float = 1.0,
+        limit_table_size: bool = True,
+    ) -> None:
+        self.max_parents = max_parents
+        self.alpha = alpha
+        self.limit_table_size = limit_table_size
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Return adjacency matrix learned from *data*.
+
+        Parameters
+        ----------
+        data : np.ndarray, shape (n_samples, n_vars)
+        n_vars : int
+        cardinality : np.ndarray, shape (n_vars,)
+        permutation : array-like of int, optional
+            Ignored by DMBBN as it is designed to be order-independent.
+        interaction_matrix : np.ndarray, optional
+        sample_weights : array of float, optional
+
+        Returns
+        -------
+        np.ndarray, shape (n_vars, n_vars)
+        """
+        n_samples = data.shape[0]
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+        scoring = K2ScoringMethod(alpha=self.alpha, sample_weights=sample_weights)
+
+        # 1. Induce n local structures (one for each variable as root)
+        # adj_counts[u, v] stores how many times edge u -> v appeared in local DAGs
+        adj_counts = np.zeros((n_vars, n_vars), dtype=int)
+
+        for root in range(n_vars):
+            local_edges = self._induce_local_structure(
+                root, data, n_vars, cardinality, scoring, mp, n_samples, interaction_matrix
+            )
+            for u, v in local_edges:
+                adj_counts[u, v] += 1
+
+        # 2. Pre-process edges: resolve direction ties and select dominant direction
+        candidates: List[Tuple[int, int, int, int]] = []
+        for u in range(n_vars):
+            for v in range(u + 1, n_vars):
+                c_uv = adj_counts[u, v]
+                c_vu = adj_counts[v, u]
+
+                if c_uv == 0 and c_vu == 0:
+                    continue
+                
+                if c_uv == c_vu:
+                    continue  # Remove tied edges
+
+                if c_uv > c_vu:
+                    # Edge u -> v
+                    candidates.append((u, v, c_uv + c_vu, c_uv - c_vu))
+                else:
+                    # Edge v -> u
+                    candidates.append((v, u, c_uv + c_vu, c_vu - c_uv))
+        
+        # 3. Build final DAG using adapted Kruskal's algorithm
+        # Sort by weight (sum) descending, then priority (diff) descending
+        candidates.sort(key=lambda x: (x[2], x[3]), reverse=True)
+
+        final_adj = np.zeros((n_vars, n_vars), dtype=int)
+        for u, v, _, _ in candidates:
+            # Check max_parents constraint for the child v
+            if np.sum(final_adj[:, v]) >= mp:
+                continue
+            # Check acyclicity
+            if not _would_create_cycle(final_adj, u, v):
+                final_adj[u, v] = 1
+
+        return final_adj
+
+    def _induce_local_structure(
+        self,
+        root: int,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        scoring: K2ScoringMethod,
+        mp: int,
+        n_samples: int,
+        interaction_matrix: Optional[np.ndarray],
+    ) -> List[Tuple[int, int]]:
+        """Induce local structure for *root* using Modified-DMBC logic."""
+        local_adj = np.zeros((n_vars, n_vars), dtype=int)
+        
+        # We follow a node ordering where 'root' is processed first.
+        # This ensures that for other nodes, we can check if 'root' is a parent.
+        nodes_order = [root] + [v for v in range(n_vars) if v != root]
+
+        for target in nodes_order:
+            initial_parents = []
+            if target != root:
+                # Modified-DMBC line 15 check: 
+                # Only proceed if root is a suitable parent for this target.
+                if interaction_matrix is not None and interaction_matrix[root, target] == 0:
+                    continue
+                
+                if self.limit_table_size:
+                    if _joint_table_size(cardinality, [target, root]) > n_samples:
+                        continue
+
+                base_score = scoring.local_score(target, [], data, cardinality)
+                with_root_score = scoring.local_score(target, [root], data, cardinality)
+                
+                if with_root_score > base_score:
+                    initial_parents = [root]
+                else:
+                    # Not a child of root, skip.
+                    continue
+            
+            # Greedily find other parents for target (could be root's parents or spouses)
+            current_parents = list(initial_parents)
+            current_score = scoring.local_score(target, current_parents, data, cardinality)
+
+            while len(current_parents) < mp:
+                improved = False
+                best_p = -1
+                best_s = current_score
+
+                for candidate in range(n_vars):
+                    if candidate == target or candidate in current_parents:
+                        continue
+                    if interaction_matrix is not None and interaction_matrix[candidate, target] == 0:
+                        continue
+                    
+                    # Ensure the local structure remains a DAG
+                    if _would_create_cycle(local_adj, candidate, target):
+                        continue
+
+                    test_parents = current_parents + [candidate]
+                    if self.limit_table_size:
+                        if _joint_table_size(cardinality, [target] + test_parents) > n_samples:
+                            continue
+                    
+                    s = scoring.local_score(target, test_parents, data, cardinality)
+                    if s > best_s:
+                        best_s = s
+                        best_p = candidate
+                        improved = True
+
+                if improved:
+                    current_parents.append(best_p)
+                    current_score = best_s
+                else:
+                    break
+            
+            # Commit to local structure
+            for p in current_parents:
+                local_adj[p, target] = 1
+
+        # Extract edges from local DAG
+        edges: List[Tuple[int, int]] = []
+        u_idx, v_idx = np.where(local_adj > 0)
+        for u, v in zip(u_idx, v_idx):
+            edges.append((int(u), int(v)))
+            
+        return edges
+
+
+# ---------------------------------------------------------------------------
 # Greedy hill-climbing (add-only)
 # ---------------------------------------------------------------------------
 

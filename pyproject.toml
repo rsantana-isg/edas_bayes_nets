@@ -1,22 +1,55 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "bayes_nets"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Discrete Bayesian network learning, sampling, and visualization"
 readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Roberto Santana", email = "roberto.santana@ehu.eus" },
+]
+keywords = [
+    "Bayesian networks", "probabilistic graphical models",
+    "structure learning", "parameter learning", "sampling",
+    "estimation of distribution algorithms", "EDA",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 requires-python = ">=3.9"
 dependencies = [
-    "numpy",
-    "scipy",
+    "numpy>=1.21",
+    "scipy>=1.7",
 ]
 
 [project.optional-dependencies]
-viz = ["matplotlib", "networkx"]
-dev = ["pytest"]
+viz = ["matplotlib>=3.4", "networkx>=3.0"]
+dev = ["pytest>=7", "pytest-cov>=3"]
+
+[project.urls]
+Homepage = "https://github.com/rsantana-isg/edas_bayes_nets"
+Repository = "https://github.com/rsantana-isg/edas_bayes_nets"
+Issues = "https://github.com/rsantana-isg/edas_bayes_nets/issues"
+
+# Single-source the version: read __version__ from bayes_nets/__init__.py so the
+# only place you bump a release number is that file.
+[tool.setuptools.dynamic]
+version = { attr = "bayes_nets.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["bayes_nets*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

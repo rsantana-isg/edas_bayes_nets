@@ -1,3 +1,4 @@
+LICENSE
 README.md
 pyproject.toml
 bayes_nets/__init__.py

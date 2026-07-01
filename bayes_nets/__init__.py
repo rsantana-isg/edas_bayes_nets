@@ -16,6 +16,7 @@ from bayes_nets.scoring import (
 )
 from bayes_nets.structure_learning import (
     K2StructureLearner,
+    DMBBNStructureLearner,
     GreedyHillClimbLearner,
     StableHillClimbLearner,
     TabuHillClimbLearner,
@@ -45,6 +46,7 @@ __all__ = [
     "DecisionTreeMDLScorer",
     "DecisionGraphBayesianScorer",
     "K2StructureLearner",
+    "DMBBNStructureLearner",
     "GreedyHillClimbLearner",
     "StableHillClimbLearner",
     "TabuHillClimbLearner",

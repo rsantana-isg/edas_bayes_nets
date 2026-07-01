@@ -1,0 +1,51 @@
+name: Publish bayes_nets to PyPI
+
+# Publishes the `bayes_nets` package to PyPI whenever a version tag is pushed.
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Uses PyPI Trusted Publishing (OIDC): no API tokens are stored as secrets.
+# One-time PyPI setup is required (see PUBLISHING.md in the pateda repo, or the
+# comment at the bottom of this file).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/bayes_nets/
+    permissions:
+      id-token: write        # required for Trusted Publishing (OIDC)
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+# ---------------------------------------------------------------------------
+# One-time PyPI configuration (Trusted Publisher) for project "bayes_nets":
+#   https://pypi.org/manage/account/publishing/  ->  add a pending publisher
+#     PyPI project name : bayes_nets
+#     Owner             : rsantana-isg
+#     Repository name   : edas_bayes_nets
+#     Workflow filename : publish.yml
+#     Environment name  : pypi
+# ---------------------------------------------------------------------------
