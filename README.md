@@ -134,6 +134,38 @@ Unconstrained greedy hill-climbing with BIC or AIC scoring.  No ordering needed;
 bn.learn_structure(data, method="bic", max_parents=3)
 ```
 
+### Advanced learners from the recent literature
+
+These learners were implemented from the papers surveyed in
+[`Other_BN_Papers_Ranked.md`](Other_BN_Papers_Ranked.md) (sources in
+`docs/Other_BN_Structure_Learning_Methods/`).  Each is available both as a
+class and through `learn_structure(method=...)`:
+
+| Method | Class / `method=` | Paper |
+|--------|-------------------|-------|
+| **DMBBN** — order-free Markov-blanket learning + Kruskal combination | `DMBBNStructureLearner` / `"dmbbn"` | Carvalho Dâmaso et al. (2026) |
+| **iter-DSLA** — iterative divide-and-conquer with community decomposition and SELECT/AND/OR mutation operators | `IterDSLALearner` / `"iterdsla"` | Jia & Li (2026) |
+| **SARTRE** — order-based edge pruning via group-lasso sparse regression | `SARTREPruner` / `"sartre"` | Kanamori et al. (2026) |
+| **Level-wise DP** — memory-efficient *exact* structure learning over the subset lattice | `LevelWiseDPLearner` / `"levelwise"` | Huang & Suzuki (2026) |
+| **BINOTEARS** — differentiable (NOTEARS-style) structure learning for binary data | `BinaryNotearsLearner` / `"binotears"` | Deng & Aragam (2025) |
+
+```python
+# order-free Markov-blanket learner
+bn.learn_structure(data, method="dmbbn", max_parents=3)
+
+# iterative decomposition learner for large networks
+bn.learn_structure(data, method="iterdsla", max_parents=3)
+
+# exact optimum for small problems (n_vars <= ~18)
+bn.learn_structure(data, method="levelwise")
+
+# prune a fully-connected DAG given a topological order
+bn.learn_structure(data, method="sartre", permutation=order)
+
+# differentiable learner for binary data
+bn.learn_structure(binary_data, method="binotears")
+```
+
 ---
 
 ## Parameter learning
@@ -145,6 +177,21 @@ bn.learn_parameters(data, alpha=1.0)   # Laplace smoothing
 ```
 
 For a root variable the CPD is a 1-D probability vector.  For a variable with parents it is a 2-D array of shape `(n_parent_configs, cardinality[var])`.
+
+### `LogisticRegressionParameterLearner`
+
+An alternative CPD estimator that fits each node with an **L1-regularised
+multinomial logistic regression** over parent-derived features (dummy
+encodings plus optional pairwise XOR interactions), following Moral et al.
+(2026).  The number of effective parameters grows *linearly* with the number
+of parents instead of exponentially, which helps in dense networks; it is a
+drop-in replacement for the MLE learner:
+
+```python
+from bayes_nets import LogisticRegressionParameterLearner
+
+bn.learn_parameters(data, parameter_learner=LogisticRegressionParameterLearner(C=5.0))
+```
 
 ---
 
@@ -210,3 +257,14 @@ def learn_bn_model(data: np.ndarray, cardinality: np.ndarray, **kwargs):
 * Pelikan, M., Goldberg, D. E., & Cantú-Paz, E. (1999). BOA: The Bayesian Optimization Algorithm. *GECCO 1999*, pp. 525–532.
 * Schwarz, G. (1978). Estimating the dimension of a model. *Annals of Statistics*, 6(2), 461–464.
 * Akaike, H. (1974). A new look at the statistical model identification. *IEEE Transactions on Automatic Control*, 19(6), 716–723.
+
+### Recent structure- and parameter-learning methods
+
+* Carvalho Dâmaso, A., et al. (2026). Learning Bayesian Network Structures Without Variable Ordering Influence: A Markov Blanket-Based Approach. *Computational Intelligence*. — `DMBBNStructureLearner`
+* Jia, X., & Li, Z. (2026). An iterative structure decomposition learning method for complex Bayesian networks. *Complex & Intelligent Systems*, 12:164. — `IterDSLALearner`
+* Moral, S., Moral-García, S., Cano, A., et al. (2026). Computing conditional probabilities in Bayesian networks using logistic regression. *Applied Soft Computing*, 198, 115284. — `LogisticRegressionParameterLearner`
+* Kanamori, T., Takagi, S., & Kobayashi, K. (2026). Sparse Additive Model Pruning for Order-Based Causal Structure Learning. *AAAI 2026*. — `SARTREPruner`
+* Huang, Z., & Suzuki, J. (2026). Memory-efficient exact Bayesian network structure learning: a single-pass level-wise dynamic program. *Behaviormetrika*. — `LevelWiseDPLearner`
+* Deng, C., & Aragam, B. (2025). Differentiable Structure Learning and Causal Discovery for General Binary Data. *NeurIPS 2025*. — `BinaryNotearsLearner`
+* Silander, T., & Myllymäki, P. (2012). A simple approach for finding the globally optimal Bayesian network structure. *UAI 2006*. (basis for the level-wise DP)
+* Zheng, X., Aragam, B., Ravikumar, P., & Xing, E. P. (2018). DAGs with NO TEARS: Continuous Optimization for Structure Learning. *NeurIPS 2018*. (basis for BINOTEARS)

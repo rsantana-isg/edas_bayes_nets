@@ -16,6 +16,10 @@ from bayes_nets.scoring import (
 )
 from bayes_nets.structure_learning import (
     K2StructureLearner,
+    K2VariantLearner,
+    mi_variable_ordering,
+    mi_candidate_mask,
+    elasticnet_candidate_mask,
     DMBBNStructureLearner,
     GreedyHillClimbLearner,
     StableHillClimbLearner,
@@ -27,9 +31,24 @@ from bayes_nets.structure_learning import (
     StablePCLearner,
     DecisionTreeLearner,
     DecisionGraphLearner,
+    LevelWiseDPLearner,
+    SARTREPruner,
+    IterDSLALearner,
+    BoundedTreewidthLearner,
+    bayesian_variable_clustering,
+    IndependentBNLearner,
+    FeatureImportanceK2Learner,
+    RFEK2Learner,
+    feature_importance_ordering,
+    rfe_ordering,
 )
-from bayes_nets.parameter_learning import MLEParameterLearner
+from bayes_nets.notears import BinaryNotearsLearner
+from bayes_nets.parameter_learning import (
+    MLEParameterLearner,
+    LogisticRegressionParameterLearner,
+)
 from bayes_nets.sampling import ProbabilisticLogicSampler
+from bayes_nets.copula import GaussianCopulaSampler
 from bayes_nets.factorization import (
     CliqueFactorization,
     moralize,
@@ -37,6 +56,7 @@ from bayes_nets.factorization import (
     junction_tree,
 )
 from bayes_nets.inference import MaxProductInference
+from bayes_nets.circuits import ArithmeticCircuit
 
 __all__ = [
     "BayesianNetwork",
@@ -46,6 +66,10 @@ __all__ = [
     "DecisionTreeMDLScorer",
     "DecisionGraphBayesianScorer",
     "K2StructureLearner",
+    "K2VariantLearner",
+    "mi_variable_ordering",
+    "mi_candidate_mask",
+    "elasticnet_candidate_mask",
     "DMBBNStructureLearner",
     "GreedyHillClimbLearner",
     "StableHillClimbLearner",
@@ -57,13 +81,27 @@ __all__ = [
     "StablePCLearner",
     "DecisionTreeLearner",
     "DecisionGraphLearner",
+    "LevelWiseDPLearner",
+    "SARTREPruner",
+    "IterDSLALearner",
+    "BoundedTreewidthLearner",
+    "bayesian_variable_clustering",
+    "IndependentBNLearner",
+    "FeatureImportanceK2Learner",
+    "RFEK2Learner",
+    "feature_importance_ordering",
+    "rfe_ordering",
+    "BinaryNotearsLearner",
     "MLEParameterLearner",
+    "LogisticRegressionParameterLearner",
     "ProbabilisticLogicSampler",
+    "GaussianCopulaSampler",
     "CliqueFactorization",
     "moralize",
     "triangulate",
     "junction_tree",
     "MaxProductInference",
+    "ArithmeticCircuit",
 ]
 
 __version__ = "0.1.0"

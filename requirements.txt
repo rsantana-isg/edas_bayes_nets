@@ -1,0 +1,22 @@
+# Python dependencies for running the EDA benchmark experiments on the cluster
+# (scripts/gen_eval_eda_benchmark.py + the bayes_nets package it imports).
+#
+# Install on the cluster (from the repository root) with:
+#     python3 -m pip install -r requirements.txt
+#
+# Do NOT install the bayes_nets package itself: the scripts add the repository
+# root to sys.path and import bayes_nets directly from the checkout, so it just
+# needs to be run from the repo root. Only the three packages below are needed.
+#
+# Runtime dependencies (import-required to run the experiments):
+#   numpy         - arrays, all numerics
+#   scipy         - stats (spearmanr, chi2, invwishart), special functions
+#   scikit-learn  - feature selection for FI_k2 / RFE_k2, elastic-net (k2_mb),
+#                   logistic-regression CPDs
+#
+# Lower bounds are conservative; the grid was validated with
+# numpy 2.3.5, scipy 1.17.1, scikit-learn 1.8.0 on Python 3.12.
+
+numpy>=1.21
+scipy>=1.7
+scikit-learn>=1.0

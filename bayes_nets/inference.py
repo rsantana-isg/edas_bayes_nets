@@ -186,12 +186,21 @@ class MaxProductInference:
     def most_probable_config(
         self,
         evidence: Optional[Dict[int, int] | Iterable[Tuple[int, int]]] = None,
+        search_method: str = "auto",
     ) -> Tuple[np.ndarray, float]:
         """Return the MAP assignment and its probability.
 
         Parameters
         ----------
         evidence : dict or iterable of (var, value) pairs, optional
+        search_method : str
+            ``"auto"`` (default) uses exact variable elimination, falling
+            back to loopy max-product when the treewidth is large.
+            ``"ve"`` forces exact variable elimination.
+            ``"loopy"`` forces damped max-product loopy belief propagation.
+            ``"srmp"`` / ``"trw"`` uses sequential reweighted message passing
+            (Kolmogorov 2015), a convergent approximate MAP solver that is
+            exact on tree-structured networks.
 
         Returns
         -------
@@ -199,6 +208,17 @@ class MaxProductInference:
         probability : float
         """
         ev = self._normalize_evidence(evidence)
+        method = str(search_method).lower()
+        if method in {"srmp", "trw", "trws"}:
+            return self._srmp_map(ev)
+        if method == "loopy":
+            return self._loopy_map(ev)
+        if method == "ve":
+            return self._ve_map(ev)
+        if method not in {"auto"}:
+            raise ValueError(
+                "search_method must be 'auto', 've', 'loopy', or 'srmp'"
+            )
         if self._should_use_loopy():
             return self._loopy_map(ev)
         return self._ve_map(ev)
@@ -377,21 +397,30 @@ class MaxProductInference:
     def marginals(
         self,
         evidence: Optional[Dict[int, int] | Iterable[Tuple[int, int]]] = None,
+        method: str = "ve",
     ) -> List[np.ndarray]:
-        """Return marginal distributions for all variables (sum-product VE).
-
-        For each query variable, all other free variables are eliminated
-        using sum-product.
+        """Return marginal distributions for all variables.
 
         Parameters
         ----------
         evidence : optional
+        method : str
+            ``"ve"`` (default) computes exact marginals by sum-product
+            variable elimination.  ``"mean_field"`` computes fast approximate
+            marginals by coordinate-ascent mean-field variational inference
+            (Li & Zemel 2014); useful when the exact junction tree is too
+            wide for repeated EDA queries.
 
         Returns
         -------
         list of np.ndarray
             ``result[i]`` has shape ``(cardinality[i],)`` and sums to 1.
         """
+        method = str(method).lower()
+        if method in {"mean_field", "meanfield", "mf"}:
+            return self.mean_field_marginals(evidence)
+        if method not in {"ve", "exact"}:
+            raise ValueError("method must be 've' or 'mean_field'")
         ev = self._normalize_evidence(evidence)
         bn = self.bn
         elim_base = self._get_elim_order()
@@ -689,3 +718,191 @@ class MaxProductInference:
             assignment[var] = int(np.argmax(belief))
 
         return assignment, self._joint_prob(assignment)
+
+    # ------------------------------------------------------------------
+    # Mean-field variational marginals  (Li & Zemel 2014)
+    # ------------------------------------------------------------------
+
+    def mean_field_marginals(
+        self,
+        evidence: Optional[Dict[int, int] | Iterable[Tuple[int, int]]] = None,
+        max_iter: int = 200,
+        tol: float = 1e-6,
+        damping: float = 0.5,
+    ) -> List[np.ndarray]:
+        """Approximate marginals by coordinate-ascent mean field.
+
+        Minimises the KL divergence to a fully factorised distribution
+        ``q(x) = ∏_v q_v(x_v)``.  Each variable's factor is updated from its
+        neighbours' expectations,
+
+            log q_v(x_v) ← Σ_{f ∋ v} E_{q_{-v}}[ log ψ_f(x_v, x_{-v}) ],
+
+        iterated with optional damping until convergence.  Always converges
+        and costs ``O(iterations · Σ_f |ψ_f|)`` — far cheaper than exact
+        elimination on wide networks, at the price of an approximation.
+
+        References
+        ----------
+        Li, Y. & Zemel, R. (2014). "Mean Field Networks." ICML Workshop /
+        arXiv:1410.5884.
+        """
+        ev = self._normalize_evidence(evidence)
+        bn = self.bn
+        damping = float(np.clip(damping, 0.0, MAX_LOOPY_DAMPING))
+        floor = 1e-12
+
+        factors = self._build_factors()
+        log_tables = [
+            (scope, np.log(np.asarray(t, dtype=float) + floor))
+            for scope, t in factors
+        ]
+        var_to_factors: List[List[int]] = [[] for _ in range(bn.n_vars)]
+        for f_idx, (scope, _) in enumerate(factors):
+            for v in scope:
+                var_to_factors[v].append(f_idx)
+
+        # Initialise q: uniform, or a delta at the evidence value.
+        q: List[np.ndarray] = []
+        for var in range(bn.n_vars):
+            card = int(bn.cardinality[var])
+            if var in ev:
+                qi = np.zeros(card)
+                qi[ev[var]] = 1.0
+            else:
+                qi = np.ones(card) / card
+            q.append(qi)
+
+        for _ in range(max(1, int(max_iter))):
+            max_delta = 0.0
+            for var in range(bn.n_vars):
+                if var in ev:
+                    continue
+                card = int(bn.cardinality[var])
+                log_qv = np.zeros(card, dtype=float)
+                for f_idx in var_to_factors[var]:
+                    scope, log_tab = log_tables[f_idx]
+                    ax = scope.index(var)
+                    weighted = log_tab
+                    for pos, other in enumerate(scope):
+                        if pos == ax:
+                            continue
+                        shape = [1] * log_tab.ndim
+                        shape[pos] = int(bn.cardinality[other])
+                        weighted = weighted * q[other].reshape(shape)
+                    axes = tuple(i for i in range(log_tab.ndim) if i != ax)
+                    log_qv += weighted.sum(axis=axes) if axes else weighted
+                log_qv -= log_qv.max()
+                new_qv = np.exp(log_qv)
+                total = new_qv.sum()
+                new_qv = new_qv / total if total > 0 else np.ones(card) / card
+                new_qv = damping * q[var] + (1.0 - damping) * new_qv
+                new_qv /= new_qv.sum()
+                max_delta = max(max_delta, float(np.max(np.abs(new_qv - q[var]))))
+                q[var] = new_qv
+            if max_delta < tol:
+                break
+
+        return q
+
+    # ------------------------------------------------------------------
+    # Sequential reweighted message passing for MAP  (Kolmogorov 2015)
+    # ------------------------------------------------------------------
+
+    def _srmp_map(
+        self,
+        ev: Dict[int, int],
+        max_iter: int = 100,
+        rho: float = 1.0,
+        tol: float = 1e-9,
+    ) -> Tuple[np.ndarray, float]:
+        """Sequential reweighted max-product for MAP-MRF (SRMP / TRW-S).
+
+        Performs block-coordinate ascent on the LP-dual of the MAP problem
+        with a forward/backward variable schedule, in the log domain.  Exact
+        on tree-structured factor graphs; a convergent approximation with a
+        certifying bound on loopy graphs.  The returned probability is the
+        exact joint probability of the decoded assignment.
+
+        References
+        ----------
+        Kolmogorov, V. (2015). "A new look at reweighted message passing."
+        IEEE TPAMI 37(5), 919-930.
+        """
+        bn = self.bn
+        floor = 1e-12
+
+        factors = self._build_factors()
+        theta = [
+            (scope, np.log(np.asarray(t, dtype=float) + floor))
+            for scope, t in factors
+        ]
+        var_to_factors: List[List[int]] = [[] for _ in range(bn.n_vars)]
+        for f_idx, (scope, _) in enumerate(factors):
+            for v in scope:
+                var_to_factors[v].append(f_idx)
+
+        # messages m_{f->v}(x_v) in log domain
+        msg_fv: Dict[Tuple[int, int], np.ndarray] = {}
+        for f_idx, (scope, _) in enumerate(factors):
+            for v in scope:
+                msg_fv[(f_idx, v)] = np.zeros(int(bn.cardinality[v]), dtype=float)
+
+        def belief(v: int) -> np.ndarray:
+            b = np.zeros(int(bn.cardinality[v]), dtype=float)
+            for f_idx in var_to_factors[v]:
+                b += msg_fv[(f_idx, v)]
+            if v in ev:
+                forced = np.full(int(bn.cardinality[v]), -np.inf)
+                forced[ev[v]] = 0.0
+                b = b + forced
+            return b
+
+        def update_factor(f_idx: int, target: int) -> None:
+            scope, tab = theta[f_idx]
+            ax = scope.index(target)
+            acc = tab.copy()
+            for pos, u in enumerate(scope):
+                if pos == ax:
+                    continue
+                # reparameterised node potential entering the factor
+                n_u = rho * belief(u) - msg_fv[(f_idx, u)]
+                shape = [1] * tab.ndim
+                shape[pos] = int(bn.cardinality[u])
+                acc = acc + n_u.reshape(shape)
+            axes = tuple(i for i in range(tab.ndim) if i != ax)
+            out = acc.max(axis=axes) if axes else acc
+            out = np.asarray(out, dtype=float)
+            out = out - out.max()  # normalise for numerical stability
+            msg_fv[(f_idx, target)] = out
+
+        order = list(range(bn.n_vars))
+        schedule = order + order[::-1]
+
+        best_assign = None
+        best_prob = -1.0
+        prev_energy = None
+        for _ in range(max(1, int(max_iter))):
+            for v in schedule:
+                if v in ev:
+                    continue
+                for f_idx in var_to_factors[v]:
+                    update_factor(f_idx, v)
+
+            assignment = np.zeros(bn.n_vars, dtype=int)
+            for v in range(bn.n_vars):
+                assignment[v] = ev[v] if v in ev else int(np.argmax(belief(v)))
+            prob = self._joint_prob(assignment)
+            if prob > best_prob:
+                best_prob = prob
+                best_assign = assignment.copy()
+
+            energy = float(sum(float(np.max(belief(v))) for v in range(bn.n_vars)))
+            if prev_energy is not None and abs(energy - prev_energy) < tol:
+                break
+            prev_energy = energy
+
+        if best_assign is None:  # pragma: no cover - defensive
+            best_assign = np.zeros(bn.n_vars, dtype=int)
+            best_prob = self._joint_prob(best_assign)
+        return best_assign, best_prob

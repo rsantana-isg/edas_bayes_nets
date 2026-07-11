@@ -80,6 +80,7 @@ from itertools import combinations
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+from scipy.special import gammaln
 from scipy.stats import chi2 as chi2_dist
 
 from bayes_nets.scoring import ScoringMethod, K2ScoringMethod
@@ -1730,6 +1731,34 @@ class DecisionTreeLearner:
 
 
 # ---------------------------------------------------------------------------
+# Scorer factory (shared by the exact / decomposition learners below)
+# ---------------------------------------------------------------------------
+
+
+def _make_scorer(
+    score: str,
+    alpha: float,
+    sample_weights: Optional[np.ndarray] = None,
+) -> ScoringMethod:
+    """Return a decomposable :class:`ScoringMethod` given a short name."""
+    from bayes_nets.scoring import (
+        BICScoringMethod,
+        AICScoringMethod,
+        K2ScoringMethod,
+    )
+
+    name = score.lower()
+    if name == "bic":
+        return BICScoringMethod(alpha=alpha, sample_weights=sample_weights)
+    if name == "aic":
+        return AICScoringMethod(alpha=alpha, sample_weights=sample_weights)
+    if name in ("k2", "bde", "bdeu"):
+        a = alpha if alpha > 0 else 1.0
+        return K2ScoringMethod(alpha=a, sample_weights=sample_weights)
+    raise ValueError(f"Unknown score '{score}'. Use 'bic', 'aic', or 'k2'.")
+
+
+# ---------------------------------------------------------------------------
 # Decision-graph HC learner  (Chickering, Heckerman & Meek 1997)
 # ---------------------------------------------------------------------------
 
@@ -1785,3 +1814,1981 @@ class DecisionGraphLearner:
             limit_table_size=self.limit_table_size,
         ).learn(data, n_vars, cardinality,
                 permutation=permutation, interaction_matrix=interaction_matrix)
+
+
+# ---------------------------------------------------------------------------
+# Memory-efficient level-wise exact DP  (Huang & Suzuki 2026)
+# ---------------------------------------------------------------------------
+
+
+class LevelWiseDPLearner:
+    """Exact BN structure learning via a level-wise dynamic program.
+
+    Finds the *globally optimal* DAG for a decomposable score by dynamic
+    programming over the subset lattice.  The traversal is organised
+    level-by-level (by subset cardinality) so that computing level ``k``
+    only requires the results from level ``k-1``; parent-set optimisation
+    and sink-node identification are fused into a single pass.  This is the
+    memory-efficient reformulation of the Silander & Myllymäki (2012) DP
+    proposed by Huang & Suzuki (2026); it returns the same optimum but with
+    a reduced peak-memory footprint (``O(sqrt(p) 2^p)`` vs ``O(p 2^p)``).
+
+    The algorithm is exact and therefore exponential in the number of
+    variables; it is intended as a "gold-standard" learner for small
+    problems (``n_vars`` up to ~20).
+
+    Parameters
+    ----------
+    score : str
+        Decomposable score: ``"bic"`` (default), ``"aic"`` or ``"k2"``.
+    alpha : float
+        Prior / smoothing parameter passed to the score.
+    max_parents : int or None
+        Maximum parents per variable.  ``None`` -> rule of thumb.  Bounding
+        the in-degree dramatically reduces the parent-set search.
+    limit_table_size : bool
+        Skip parent sets whose joint table would exceed the sample count.
+    max_vars : int
+        Hard guard: raise ``ValueError`` when ``n_vars`` exceeds this
+        (default 20) to avoid accidentally launching an intractable run.
+
+    References
+    ----------
+    Huang & Suzuki (2026). "Memory-efficient exact Bayesian network
+    structure learning: a single-pass level-wise dynamic program."
+    Behaviormetrika.
+    """
+
+    def __init__(
+        self,
+        score: str = "bic",
+        alpha: float = 1.0,
+        max_parents: Optional[int] = None,
+        limit_table_size: bool = True,
+        max_vars: int = 20,
+    ) -> None:
+        self.score = score
+        self.alpha = alpha
+        self.max_parents = max_parents
+        self.limit_table_size = limit_table_size
+        self.max_vars = max_vars
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Return the globally optimal adjacency matrix for the score.
+
+        ``permutation`` is ignored (the exact DP searches over all orders).
+        ``interaction_matrix`` restricts the candidate parents when given.
+        """
+        if n_vars > self.max_vars:
+            raise ValueError(
+                f"LevelWiseDPLearner is exact/exponential; n_vars={n_vars} "
+                f"exceeds max_vars={self.max_vars}. Raise max_vars to force it."
+            )
+
+        data = np.asarray(data)
+        n_samples = data.shape[0]
+        cardinality = np.asarray(cardinality, dtype=int)
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+        scorer = _make_scorer(self.score, self.alpha, sample_weights)
+
+        # Allowed parents per variable (interaction constraint only; the DP
+        # explores every ordering itself).
+        allowed_mask = np.ones((n_vars, n_vars), dtype=bool)
+        if interaction_matrix is not None:
+            allowed_mask = np.asarray(interaction_matrix) != 0
+        np.fill_diagonal(allowed_mask, False)
+
+        full = (1 << n_vars) - 1
+
+        # --- Step 1+2: best parent set of each var, drawn from every subset -
+        # best_ps_score[v][C] = best local score of v using parents P subset of C
+        # best_ps_set[v][C]   = the argmax parent set P (as a bitmask)
+        # Computed level-wise over C by cardinality.
+        local_cache: Dict[Tuple[int, int], float] = {}
+
+        def local(v: int, pa_mask: int) -> float:
+            key = (v, pa_mask)
+            hit = local_cache.get(key)
+            if hit is not None:
+                return hit
+            parents = [u for u in range(n_vars) if (pa_mask >> u) & 1]
+            if len(parents) > mp or any(not allowed_mask[u, v] for u in parents):
+                val = -np.inf
+            elif self.limit_table_size and _joint_table_size(cardinality, [v] + parents) > n_samples:
+                val = -np.inf
+            else:
+                val = scorer.local_score(v, parents, data, cardinality)
+            local_cache[key] = val
+            return val
+
+        # best_ps over candidate sets C (subsets of V \ {v}).
+        best_ps_score = [dict() for _ in range(n_vars)]
+        best_ps_set = [dict() for _ in range(n_vars)]
+        for v in range(n_vars):
+            cand_all = full & ~(1 << v)
+            bs = best_ps_score[v]
+            bp = best_ps_set[v]
+            bs[0] = local(v, 0)
+            bp[0] = 0
+            # Enumerate subsets C of cand_all in increasing cardinality.
+            for C in _subsets_by_level(cand_all, n_vars):
+                if C == 0:
+                    continue
+                best_val = local(v, C)      # use *all* of C as parents
+                best_set = C
+                # or drop one element and reuse the smaller optimum
+                cc = C
+                while cc:
+                    low = cc & (-cc)
+                    Cwithout = C & ~low
+                    cand_val = bs.get(Cwithout, -np.inf)
+                    if cand_val > best_val:
+                        best_val = cand_val
+                        best_set = bp.get(Cwithout, 0)
+                    cc ^= low
+                bs[C] = best_val
+                bp[C] = best_set
+
+        # --- Step 3+4: sink-node DP over all subsets S of V ------------------
+        # g[S]    = best total score achievable over the sub-DAG on nodes S
+        # sink[S] = the sink variable achieving g[S]
+        g = {0: 0.0}
+        sink: Dict[int, int] = {}
+        for S in _subsets_by_level(full, n_vars):
+            if S == 0:
+                continue
+            best_total = -np.inf
+            best_sink = -1
+            s = S
+            while s:
+                low = s & (-s)
+                v = low.bit_length() - 1
+                rest = S & ~low
+                val = g[rest] + best_ps_score[v].get(rest, -np.inf)
+                if val > best_total:
+                    best_total = val
+                    best_sink = v
+                s ^= low
+            g[S] = best_total
+            sink[S] = best_sink
+
+        # --- Reconstruct optimal DAG by peeling sinks -----------------------
+        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        S = full
+        while S:
+            v = sink[S]
+            rest = S & ~(1 << v)
+            pa_mask = best_ps_set[v].get(rest, 0)
+            for u in range(n_vars):
+                if (pa_mask >> u) & 1:
+                    adjacency[u, v] = 1
+            S = rest
+
+        return adjacency
+
+
+def _subsets_by_level(mask: int, n_vars: int) -> List[int]:
+    """Return all sub-masks of *mask* ordered by increasing popcount.
+
+    Enumerating subsets by cardinality realises the level-wise traversal:
+    every subset of size ``k`` precedes those of size ``k+1``.
+    """
+    members = [i for i in range(n_vars) if (mask >> i) & 1]
+    result: List[int] = [0]
+    from itertools import combinations as _combos
+    for k in range(1, len(members) + 1):
+        for combo in _combos(members, k):
+            sub = 0
+            for i in combo:
+                sub |= (1 << i)
+            result.append(sub)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SARTRE pruning  (Kanamori et al. 2026)
+# ---------------------------------------------------------------------------
+
+
+def _group_lasso_bcd(
+    phi: np.ndarray,
+    y: np.ndarray,
+    groups: List[np.ndarray],
+    lam: float,
+    max_iter: int = 200,
+    tol: float = 1e-5,
+) -> np.ndarray:
+    """Solve group-lasso  ½‖y-Φβ‖² + λ Σ_g ‖β_g‖₂  by block-coord descent.
+
+    ``groups`` is a list of index arrays partitioning the columns of ``phi``.
+    Returns the coefficient vector β.  Each block update solves the group
+    sub-problem in closed form using the block's Gram matrix.
+    """
+    n, p = phi.shape
+    beta = np.zeros(p, dtype=float)
+    residual = y - phi @ beta
+    grams = [phi[:, g].T @ phi[:, g] for g in groups]
+    # Ridge-stabilised inverse for the "keep" branch.
+    inv = []
+    for G, gidx in zip(grams, groups):
+        d = G.shape[0]
+        inv.append(np.linalg.pinv(G + 1e-8 * np.eye(d)))
+
+    for _ in range(max_iter):
+        max_change = 0.0
+        for gi, g in enumerate(groups):
+            phg = phi[:, g]
+            # partial residual excluding this group
+            residual += phg @ beta[g]
+            z = phg.T @ residual
+            new_beta_g = np.zeros_like(beta[g])
+            if np.linalg.norm(z) > lam:
+                # Solve (G + λ/‖β_g‖ I) β_g = z  via a few fixed-point steps.
+                bg = inv[gi] @ z
+                for _inner in range(25):
+                    nrm = np.linalg.norm(bg)
+                    if nrm < 1e-12:
+                        break
+                    Gr = grams[gi] + (lam / nrm) * np.eye(len(g))
+                    bg_new = np.linalg.solve(Gr, z)
+                    if np.linalg.norm(bg_new - bg) < 1e-9:
+                        bg = bg_new
+                        break
+                    bg = bg_new
+                new_beta_g = bg
+            change = np.linalg.norm(new_beta_g - beta[g])
+            max_change = max(max_change, change)
+            beta[g] = new_beta_g
+            residual -= phg @ beta[g]
+        if max_change < tol:
+            break
+    return beta
+
+
+class SARTREPruner:
+    """SARTRE: order-based edge pruning by group-sparse regression.
+
+    Given a topological order (``permutation``), SARTRE builds the
+    fully-connected DAG induced by that order and then prunes spurious
+    candidate parents of each variable.  Each candidate parent contributes a
+    *group* of one-hot indicator features (the discrete analogue of the
+    randomized-tree-embedding intervals used for continuous data by Kanamori
+    et al.).  A group-lasso regression of the child on all candidate-parent
+    feature groups drives whole groups to zero; a parent whose group vanishes
+    is pruned.  This avoids the repeated hypothesis testing of CAM-pruning.
+
+    The pruner needs an ordering.  Pass one via ``permutation``; if none is
+    given it falls back to the natural order ``[0, 1, ..., n_vars-1]``.  It is
+    designed to be chained after an order-estimating learner such as
+    :class:`K2StructureLearner` or :class:`PCLearner`.
+
+    Parameters
+    ----------
+    lam : float
+        Group-lasso regularisation strength (per-sample scaled).  Larger
+        values prune more aggressively.
+    max_parents : int or None
+        Cap on retained parents per variable (rule of thumb if ``None``).
+    tol : float
+        A parent group with L2 norm below ``tol`` is pruned.
+
+    References
+    ----------
+    Kanamori, Takagi, Kobayashi (2026). "Sparse Additive Model Pruning for
+    Order-Based Causal Structure Learning."
+    """
+
+    def __init__(
+        self,
+        lam: float = 0.05,
+        max_parents: Optional[int] = None,
+        tol: float = 1e-4,
+    ) -> None:
+        self.lam = lam
+        self.max_parents = max_parents
+        self.tol = tol
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        data = np.asarray(data, dtype=int)
+        n_samples = data.shape[0]
+        cardinality = np.asarray(cardinality, dtype=int)
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+
+        order = (np.arange(n_vars, dtype=int) if permutation is None
+                 else np.asarray(permutation, dtype=int))
+        perm_pos = _compute_perm_pos(n_vars, order)
+
+        # Per-row effective weights.  ``sample_weights`` is a probability
+        # vector over rows (sums to 1); scaling by N gives effective counts
+        # summing to N, so the group-lasso penalty (lam * N) stays calibrated.
+        # A weighted least-squares fit is obtained by centring on the weighted
+        # mean and scaling every row of phi and y by sqrt(effective weight);
+        # then ||sqrt(w)·(y - phi·b)||^2 == sum_i w_i (y_i - phi_i·b)^2.
+        if sample_weights is None:
+            eff_w = np.ones(n_samples, dtype=float)
+        else:
+            eff_w = np.asarray(sample_weights, dtype=float) * n_samples
+        w_total = eff_w.sum()
+        sw_sqrt = np.sqrt(eff_w)
+
+        def _wmean(col: np.ndarray) -> float:
+            return float((eff_w * col).sum() / w_total)
+
+        # One-hot encoding of each variable (drop-first to avoid collinearity),
+        # weighted-centred and row-scaled so all regressions share the same
+        # whitening.
+        encoders: List[np.ndarray] = []
+        for v in range(n_vars):
+            k = int(cardinality[v])
+            if k <= 2:
+                cols = data[:, v].reshape(-1, 1).astype(float)
+            else:
+                cols = np.zeros((n_samples, k - 1), dtype=float)
+                for s in range(1, k):
+                    cols[:, s - 1] = (data[:, v] == s).astype(float)
+            for j in range(cols.shape[1]):
+                cols[:, j] -= _wmean(cols[:, j])
+            cols *= sw_sqrt[:, None]
+            encoders.append(cols)
+
+        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        lam_eff = self.lam * n_samples
+
+        for v in range(n_vars):
+            candidates = [
+                u for u in range(n_vars)
+                if perm_pos[u] < perm_pos[v]
+                and (interaction_matrix is None or interaction_matrix[u, v] != 0)
+            ]
+            if not candidates:
+                continue
+
+            blocks = [encoders[u] for u in candidates]
+            phi = np.hstack(blocks)
+            groups, start = [], 0
+            for b in blocks:
+                groups.append(np.arange(start, start + b.shape[1]))
+                start += b.shape[1]
+
+            y_raw = data[:, v].astype(float)
+            y = sw_sqrt * (y_raw - _wmean(y_raw))
+
+            beta = _group_lasso_bcd(phi, y, groups, lam_eff)
+
+            # rank surviving parents by group norm, keep up to mp
+            norms = [(np.linalg.norm(beta[g]), u) for g, u in zip(groups, candidates)]
+            survivors = [(nrm, u) for nrm, u in norms if nrm > self.tol]
+            survivors.sort(reverse=True)
+            for nrm, u in survivors[:mp]:
+                adjacency[u, v] = 1
+
+        return adjacency
+
+
+# ---------------------------------------------------------------------------
+# iter-DSLA: iterative structure decomposition learning  (Jia & Li 2026)
+# ---------------------------------------------------------------------------
+
+
+def _to_skeleton(adjacency: np.ndarray) -> np.ndarray:
+    """Undirected skeleton of a DAG (symmetric 0/1 matrix, no self-loops)."""
+    skel = ((adjacency != 0) | (adjacency.T != 0)).astype(int)
+    np.fill_diagonal(skel, 0)
+    return skel
+
+
+def _community_fitness(skeleton: np.ndarray, community: Set[int], alpha: float) -> float:
+    """Lancichinetti fitness  f(C) = k_in / (k_in + k_out)^alpha."""
+    if not community:
+        return 0.0
+    nodes = list(community)
+    sub = skeleton[np.ix_(nodes, nodes)]
+    k_in = float(sub.sum())                       # 2 * internal edges
+    deg = float(skeleton[nodes, :].sum())         # total degree of community
+    k_out = deg - k_in
+    denom = (k_in + k_out) ** alpha
+    return k_in / denom if denom > 0 else 0.0
+
+
+def _decompose_communities(
+    skeleton: np.ndarray,
+    n_vars: int,
+    alpha: float = 1.0,
+    beta: float = 0.5,
+    max_community: Optional[int] = None,
+) -> List[List[int]]:
+    """Locally-extended overlapping community detection (iter-DSLA Alg. 6).
+
+    Expansion: grow a community from a seed by repeatedly adding the
+    neighbour that most improves the fitness function, until no improvement.
+    Merging: fuse two communities whose node overlap exceeds ``beta``.
+    """
+    if max_community is None:
+        max_community = n_vars
+    neighbors = [set(np.where(skeleton[v] != 0)[0].tolist()) for v in range(n_vars)]
+
+    covered: Set[int] = set()
+    groups: List[Set[int]] = []
+    # seed from highest-degree uncovered node first (deterministic)
+    order = sorted(range(n_vars), key=lambda v: -len(neighbors[v]))
+
+    for seed in order:
+        # skip only if this node and all its neighbours are already covered
+        if seed in covered and all(nb in covered for nb in neighbors[seed]):
+            continue
+        community = {seed}
+        cur_fit = _community_fitness(skeleton, community, alpha)
+        while len(community) < max_community:
+            frontier = set()
+            for u in community:
+                frontier |= neighbors[u]
+            frontier -= community
+            if not frontier:
+                break
+            best_gain, best_node = 0.0, -1
+            for cand in frontier:
+                f = _community_fitness(skeleton, community | {cand}, alpha)
+                if f - cur_fit > best_gain:
+                    best_gain, best_node = f - cur_fit, cand
+            if best_node < 0:
+                break
+            community.add(best_node)
+            cur_fit += best_gain
+        groups.append(community)
+        covered |= community
+
+    # any never-covered node (isolated) becomes its own singleton community
+    for v in range(n_vars):
+        if v not in covered:
+            groups.append({v})
+
+    # merge overly-overlapping communities
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                a, b = groups[i], groups[j]
+                if not a or not b:
+                    continue
+                overlap = len(a & b)
+                if overlap and overlap >= beta * min(len(a), len(b)):
+                    groups[i] = a | b
+                    groups[j] = set()
+                    merged = True
+            if merged:
+                break
+        groups = [g for g in groups if g]
+
+    return [sorted(g) for g in groups]
+
+
+def _combine_subdags(
+    sub_adjs: List[Tuple[List[int], np.ndarray]],
+    data: np.ndarray,
+    n_vars: int,
+    cardinality: np.ndarray,
+    scorer: ScoringMethod,
+    mp: int,
+) -> np.ndarray:
+    """Combine per-community sub-DAGs into one global DAG.
+
+    Conflicting / overlapping edges are resolved greedily: every proposed
+    directed edge is weighted by its local-score delta and inserted in
+    descending order while preserving acyclicity and the parent cap.
+    """
+    # collect candidate directed edges (union over communities)
+    proposed: Set[Tuple[int, int]] = set()
+    for nodes, adj in sub_adjs:
+        idx = np.array(nodes)
+        us, vs = np.where(adj != 0)
+        for u, v in zip(us, vs):
+            proposed.add((int(idx[u]), int(idx[v])))
+
+    # weight each edge by the score gain of adding u as a parent of v
+    scored = []
+    base_cache: Dict[int, float] = {}
+    for (u, v) in proposed:
+        gain = (scorer.local_score(v, [u], data, cardinality)
+                - scorer.local_score(v, [], data, cardinality))
+        scored.append((gain, u, v))
+    scored.sort(key=lambda t: (t[0], -t[1], -t[2]), reverse=True)
+
+    adjacency = np.zeros((n_vars, n_vars), dtype=int)
+    for gain, u, v in scored:
+        if int(adjacency[:, v].sum()) >= mp:
+            continue
+        if adjacency[v, u] == 1:          # opposite edge already placed
+            continue
+        if not _would_create_cycle(adjacency, u, v):
+            adjacency[u, v] = 1
+    return adjacency
+
+
+class IterDSLALearner:
+    """iter-DSLA: iterative structure decomposition learning.
+
+    A divide-and-conquer learner for large / complex Bayesian networks
+    (Jia & Li 2026).  Each iteration:
+
+    1. **Construct** three undirected initial graphs (from the top-3 networks
+       of the previous round via the SELECT / AND / OR operators).
+    2. **Decompose** each into overlapping communities (Algorithm 6).
+    3. **Learn** a sub-DAG for every community with a global base learner.
+    4. **Combine** the sub-DAGs into a full DAG, resolving conflicts by score.
+    5. **Update** the top-3 highest-scoring (distinct) networks.
+    6. **Iterate** until ``n_iter`` is reached; return the best network.
+
+    The three mutation operators keep the search out of local optima:
+    SELECT keeps the skeleton of the best network, AND intersects the three
+    skeletons (conservative), OR unions them (exploratory).
+
+    Parameters
+    ----------
+    base_learner : object or None
+        Any learner exposing ``learn(data, n_vars, cardinality,
+        interaction_matrix=...)``.  Defaults to a
+        :class:`StableHillClimbLearner` with a BIC score.
+    n_iter : int
+        Number of iterations (paper default 10; converges in ~4-5).
+    alpha_comm, beta_comm : float
+        Community-detection size controls (fitness exponent / merge overlap).
+    score : str
+        Decomposable score used to rank whole networks.
+    alpha : float
+        Score smoothing parameter.
+    max_parents : int or None
+    seed : int or None
+        Seed for the random initial networks (reproducibility).
+
+    References
+    ----------
+    Jia & Li (2026). "An iterative structure decomposition learning method
+    for complex Bayesian networks." Complex & Intelligent Systems.
+    """
+
+    def __init__(
+        self,
+        base_learner=None,
+        n_iter: int = 10,
+        alpha_comm: float = 1.0,
+        beta_comm: float = 0.5,
+        score: str = "bic",
+        alpha: float = 1.0,
+        max_parents: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.base_learner = base_learner
+        self.n_iter = n_iter
+        self.alpha_comm = alpha_comm
+        self.beta_comm = beta_comm
+        self.score = score
+        self.alpha = alpha
+        self.max_parents = max_parents
+        self.seed = seed
+
+    # -- operators ------------------------------------------------------
+    @staticmethod
+    def _select(skels: List[np.ndarray], scores: List[float]) -> np.ndarray:
+        return skels[int(np.argmax(scores))].copy()
+
+    @staticmethod
+    def _and(skels: List[np.ndarray]) -> np.ndarray:
+        out = skels[0].copy()
+        for s in skels[1:]:
+            out &= s
+        return out
+
+    @staticmethod
+    def _or(skels: List[np.ndarray]) -> np.ndarray:
+        out = skels[0].copy()
+        for s in skels[1:]:
+            out |= s
+        return out
+
+    # -- core -----------------------------------------------------------
+    def _learn_from_skeleton(
+        self, skeleton, data, n_vars, cardinality, base, scorer, mp, global_inter,
+        sample_weights=None,
+    ) -> np.ndarray:
+        """Decompose the skeleton, learn each community, and recombine.
+
+        The input skeleton is used only to *decompose* the problem into
+        communities (Algorithm 6).  Within each community the global base
+        learner searches freely over all node pairs (subject to the global
+        ``interaction_matrix`` if one was supplied), so genuinely new edges
+        can be discovered from one iteration to the next.
+
+        ``sample_weights`` (a probability vector over rows) is forwarded to the
+        base learner unchanged: communities only subset *columns*, so the same
+        per-row weights apply to every sub-problem.  The default base learner
+        already carries the weighted scorer, but a user-supplied learner needs
+        the weights passed through here.
+        """
+        communities = _decompose_communities(
+            skeleton, n_vars, self.alpha_comm, self.beta_comm
+        )
+        sub_adjs: List[Tuple[List[int], np.ndarray]] = []
+        for nodes in communities:
+            if len(nodes) == 1:
+                sub_adjs.append((nodes, np.zeros((1, 1), dtype=int)))
+                continue
+            sub_data = data[:, nodes]
+            sub_card = cardinality[nodes]
+            inter = None
+            if global_inter is not None:
+                inter = global_inter[np.ix_(nodes, nodes)]
+            sub_adj = base.learn(
+                sub_data, len(nodes), sub_card,
+                interaction_matrix=inter, sample_weights=sample_weights,
+            )
+            sub_adjs.append((nodes, sub_adj))
+        return _combine_subdags(sub_adjs, data, n_vars, cardinality, scorer, mp)
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        data = np.asarray(data)
+        cardinality = np.asarray(cardinality, dtype=int)
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+        scorer = _make_scorer(self.score, self.alpha, sample_weights)
+        rng = np.random.default_rng(self.seed)
+
+        base = self.base_learner
+        if base is None:
+            base = StableHillClimbLearner(
+                scoring=_make_scorer(self.score, self.alpha, sample_weights),
+                max_parents=mp,
+            )
+
+        def total_score(adj: np.ndarray) -> float:
+            return scorer.score(adj, data, cardinality)
+
+        # ---- Step 1: three random initial DAGs -> skeletons ---------------
+        def random_dag() -> np.ndarray:
+            perm = rng.permutation(n_vars)
+            adj = np.zeros((n_vars, n_vars), dtype=int)
+            for a in range(n_vars):
+                for b in range(a + 1, n_vars):
+                    u, v = perm[a], perm[b]
+                    if interaction_matrix is not None and interaction_matrix[u, v] == 0:
+                        continue
+                    if rng.random() < 0.3 and int(adj[:, v].sum()) < mp:
+                        adj[u, v] = 1
+            return adj
+
+        top_adjs = [random_dag() for _ in range(3)]
+        top_scores = [total_score(a) for a in top_adjs]
+
+        best_adj = top_adjs[int(np.argmax(top_scores))].copy()
+        best_score = max(top_scores)
+
+        for _ in range(self.n_iter):
+            skels = [_to_skeleton(a) for a in top_adjs]
+            # three mutation operators -> three initial undirected graphs
+            init_graphs = [
+                self._select(skels, top_scores),
+                self._and(skels),
+                self._or(skels),
+            ]
+            if interaction_matrix is not None:
+                im = (np.asarray(interaction_matrix) != 0).astype(int)
+                im = ((im | im.T) > 0).astype(int)
+                np.fill_diagonal(im, 0)
+                init_graphs = [g & im for g in init_graphs]
+
+            new_adjs, new_scores = [], []
+            for g in init_graphs:
+                adj = self._learn_from_skeleton(
+                    g, data, n_vars, cardinality, base, scorer, mp, interaction_matrix,
+                    sample_weights=sample_weights,
+                )
+                new_adjs.append(adj)
+                new_scores.append(total_score(adj))
+
+            # ---- Step 5: keep top-3 distinct among old + new --------------
+            pool = list(zip(top_scores, top_adjs)) + list(zip(new_scores, new_adjs))
+            pool.sort(key=lambda t: t[0], reverse=True)
+            chosen_adjs, chosen_scores, seen = [], [], set()
+            for sc, adj in pool:
+                key = adj.tobytes()
+                if key in seen:
+                    continue
+                seen.add(key)
+                chosen_adjs.append(adj)
+                chosen_scores.append(sc)
+                if len(chosen_adjs) == 3:
+                    break
+            while len(chosen_adjs) < 3:            # pad if fewer than 3 distinct
+                chosen_adjs.append(chosen_adjs[-1].copy())
+                chosen_scores.append(chosen_scores[-1])
+            top_adjs, top_scores = chosen_adjs, chosen_scores
+
+            if top_scores[0] > best_score:
+                best_score = top_scores[0]
+                best_adj = top_adjs[0].copy()
+
+        return best_adj
+
+
+# ---------------------------------------------------------------------------
+# Bounded-treewidth BN learning via k-tree sampling  (Nie et al. 2014)
+# ---------------------------------------------------------------------------
+
+
+def _sample_k_tree(
+    n_vars: int,
+    k: int,
+    rng: np.random.Generator,
+    order: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[int, List[int]]]:
+    """Sample a random k-tree and its induced candidate-parent sets.
+
+    A k-tree on ``n_vars`` nodes is a maximal graph of treewidth ``k``,
+    built by starting from a ``(k+1)``-clique and repeatedly attaching each
+    new node to a randomly chosen existing ``k``-clique (Nie et al. 2014,
+    Corollary 1).  Nodes are introduced in the order ``order`` (a random
+    permutation when ``None``).  Because every new node's earlier neighbours
+    are exactly the ``k``-clique it attached to, those neighbours form a
+    clique; hence any DAG whose parents are drawn from these candidate sets
+    has a moral graph that is a subgraph of the k-tree, guaranteeing
+    treewidth ``≤ k``.
+
+    Returns
+    -------
+    ktree : np.ndarray, shape (n_vars, n_vars)
+        Symmetric adjacency of the sampled k-tree.
+    candidate_parents : dict[int, list[int]]
+        For every variable, the earlier-introduced nodes it may take as
+        parents (a clique in the k-tree).
+    """
+    if order is None:
+        pi = rng.permutation(n_vars)
+    else:
+        pi = np.asarray(order, dtype=int)
+
+    ktree = np.zeros((n_vars, n_vars), dtype=int)
+    candidate_parents: Dict[int, List[int]] = {int(v): [] for v in range(n_vars)}
+
+    n_init = min(k + 1, n_vars)
+    init_nodes = [int(pi[j]) for j in range(n_init)]
+    # Fully connect the initial clique; candidate parents follow the order.
+    for a in range(n_init):
+        for b in range(a):
+            ktree[init_nodes[a], init_nodes[b]] = 1
+            ktree[init_nodes[b], init_nodes[a]] = 1
+        candidate_parents[init_nodes[a]] = init_nodes[:a]
+
+    # List of current k-cliques (each a sorted tuple of k node indices).
+    k_cliques: List[Tuple[int, ...]] = []
+    if n_init >= k and k > 0:
+        for combo in combinations(init_nodes, k):
+            k_cliques.append(tuple(sorted(combo)))
+    elif k == 0:
+        k_cliques = []
+
+    for j in range(n_init, n_vars):
+        u = int(pi[j])
+        if k_cliques:
+            clique = k_cliques[int(rng.integers(len(k_cliques)))]
+        else:
+            clique = tuple(init_nodes[:k])
+        parents = list(clique)
+        candidate_parents[u] = parents
+        for w in parents:
+            ktree[u, w] = 1
+            ktree[w, u] = 1
+        # Register the k new k-cliques created by adding u.
+        for w in parents:
+            new_clique = tuple(sorted(set(parents) - {w} | {u}))
+            if len(new_clique) == k:
+                k_cliques.append(new_clique)
+
+    return ktree, candidate_parents
+
+
+class BoundedTreewidthLearner:
+    """Learn a Bayesian network whose moral graph has treewidth ≤ ``k``.
+
+    Implements the approximate k-tree sampling method of Nie, Mauá, de Campos
+    & Ji (2014): sample several random k-trees, and for each pick the
+    highest-scoring DAG whose families lie inside the k-tree, then keep the
+    best DAG over all samples.  Bounding treewidth at learning time
+    guarantees that subsequent junction-tree inference and sampling stay
+    cheap (cost exponential in ``k`` only) — the natural structure learner
+    for repeated use inside Estimation of Distribution Algorithms.
+
+    Parameters
+    ----------
+    k : int
+        Treewidth bound (``k=1`` recovers a tree/forest).
+    n_ktrees : int
+        Number of random k-trees sampled; the best DAG is returned.
+    score : str
+        Decomposable score name (``"bic"``, ``"aic"`` or ``"k2"``).
+    alpha : float
+        Score smoothing / equivalent-sample-size parameter.
+    max_parents : int or None
+        Extra cap on parents (the effective cap is ``min(k, max_parents)``).
+    limit_table_size : bool
+        Skip candidate parent sets whose joint table exceeds the sample size.
+    seed : int or None
+        Seed for the k-tree sampler (reproducibility).
+
+    References
+    ----------
+    Nie, S., Mauá, D. D., de Campos, C. P. & Ji, Q. (2014).
+    "Advances in Learning Bayesian Networks of Bounded Treewidth."
+    Advances in Neural Information Processing Systems (NeurIPS) 27.
+    arXiv:1406.1411.
+    """
+
+    def __init__(
+        self,
+        k: int = 2,
+        n_ktrees: int = 100,
+        score: str = "bic",
+        alpha: float = 1.0,
+        max_parents: Optional[int] = None,
+        limit_table_size: bool = True,
+        seed: Optional[int] = None,
+    ) -> None:
+        if k < 1:
+            raise ValueError("k (treewidth bound) must be >= 1")
+        self.k = int(k)
+        self.n_ktrees = int(n_ktrees)
+        self.score = score
+        self.alpha = alpha
+        self.max_parents = max_parents
+        self.limit_table_size = limit_table_size
+        self.seed = seed
+        # Populated after learn(): the k-tree behind the returned DAG.
+        self.ktree_: Optional[np.ndarray] = None
+
+    def _best_dag_for_ktree(
+        self,
+        candidate_parents: Dict[int, List[int]],
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        scorer: ScoringMethod,
+        cap: int,
+        interaction_matrix: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, float]:
+        """Greedy score-maximising DAG within one k-tree (K2-style)."""
+        n_samples = data.shape[0]
+        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        total = 0.0
+        for v in range(n_vars):
+            possible = [
+                p for p in candidate_parents[v]
+                if interaction_matrix is None or interaction_matrix[p, v] != 0
+            ]
+            current: List[int] = []
+            current_score = scorer.local_score(v, current, data, cardinality)
+            improved = True
+            while improved and len(current) < cap:
+                improved = False
+                best_parent = -1
+                best_score = current_score
+                for cand in possible:
+                    if cand in current:
+                        continue
+                    trial = current + [cand]
+                    if self.limit_table_size and _joint_table_size(
+                        cardinality, [v] + trial
+                    ) > n_samples:
+                        continue
+                    s = scorer.local_score(v, trial, data, cardinality)
+                    if s > best_score:
+                        best_score = s
+                        best_parent = cand
+                        improved = True
+                if improved:
+                    current.append(best_parent)
+                    current_score = best_score
+            for p in current:
+                adjacency[p, v] = 1
+            total += current_score
+        return adjacency, total
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        data = np.asarray(data)
+        cardinality = np.asarray(cardinality, dtype=int)
+        rng = np.random.default_rng(self.seed)
+        scorer = _make_scorer(self.score, self.alpha, sample_weights)
+
+        k = min(self.k, max(1, n_vars - 1))
+        cap = k if self.max_parents is None else min(k, self.max_parents)
+
+        # A fixed permutation (if supplied) fixes the node-introduction order;
+        # otherwise every sampled k-tree draws its own random order.
+        fixed_order = None if permutation is None else np.asarray(permutation, dtype=int)
+
+        best_adj = np.zeros((n_vars, n_vars), dtype=int)
+        best_score = -np.inf
+        best_ktree = np.zeros((n_vars, n_vars), dtype=int)
+
+        for _ in range(max(1, self.n_ktrees)):
+            ktree, candidate_parents = _sample_k_tree(n_vars, k, rng, fixed_order)
+            adj, total = self._best_dag_for_ktree(
+                candidate_parents, data, n_vars, cardinality,
+                scorer, cap, interaction_matrix,
+            )
+            if total > best_score:
+                best_score = total
+                best_adj = adj
+                best_ktree = ktree
+
+        self.ktree_ = best_ktree
+        return best_adj
+
+
+# ---------------------------------------------------------------------------
+# Bayesian hierarchical clustering of variables  (Marrelec et al. 2015)
+# ---------------------------------------------------------------------------
+
+
+def _dirichlet_multinomial_log_ml(
+    data: np.ndarray,
+    variables: List[int],
+    cardinality: np.ndarray,
+    alpha: float,
+    weights: np.ndarray,
+) -> float:
+    """Log marginal likelihood of *variables* under a Dirichlet-multinomial.
+
+    Treats the joint configuration of ``variables`` as a single multinomial
+    with a symmetric ``Dirichlet(alpha)`` prior (total pseudo-count
+    ``alpha`` spread over all configurations).  This is the BDeu/K2 family
+    marginal likelihood and provides the discrete analogue of the Gaussian
+    evidence used by Marrelec et al. (2015).
+    """
+    n_configs = int(np.prod(cardinality[np.asarray(variables, dtype=int)]))
+    mult = 1
+    idx = np.zeros(data.shape[0], dtype=int)
+    for v in variables:
+        idx += data[:, v] * mult
+        mult *= int(cardinality[v])
+    counts = np.bincount(idx, weights=weights, minlength=n_configs)
+    n = float(counts.sum())
+    a_c = alpha / n_configs
+    ll = gammaln(alpha) - gammaln(alpha + n)
+    ll += float(np.sum(gammaln(a_c + counts) - gammaln(a_c)))
+    return ll
+
+
+def bayesian_variable_clustering(
+    data: np.ndarray,
+    cardinality: np.ndarray,
+    *,
+    sample_weights: Optional[np.ndarray] = None,
+    alpha: float = 1.0,
+    stop_threshold: float = 0.0,
+    max_config: Optional[int] = None,
+) -> Dict[str, object]:
+    """Agglomerative hierarchical clustering of *variables* (linkage tree).
+
+    Merges the pair of variable clusters with the largest **log Bayes
+    factor** in favour of dependence, i.e.
+
+        logBF(A, B) = logML(A ∪ B) − logML(A) − logML(B),
+
+    where ``logML`` is the Dirichlet-multinomial marginal likelihood.  A
+    positive logBF means the joint model beats the independent (product of
+    marginals) model, so the clusters are dependent and worth merging.  The
+    procedure stops automatically when no merge exceeds ``stop_threshold``
+    (default 0), removing the need for an arbitrary cut height.  Unlike raw
+    mutual-information linkage, the Bayes factor corrects for the
+    dimensionality of the merged configuration space.
+
+    The resulting flat clustering is directly usable as a marginal-product
+    (linkage-tree) factorization for EDA sampling, or as a prior for the
+    community-based structure learners (:class:`DMBBNStructureLearner`,
+    :class:`IterDSLALearner`).
+
+    Parameters
+    ----------
+    data : np.ndarray, shape (n_samples, n_vars)
+    cardinality : np.ndarray, shape (n_vars,)
+    sample_weights : array of float, optional
+        Probability weights over rows (defaults to uniform).
+    alpha : float
+        Dirichlet-multinomial equivalent sample size.
+    stop_threshold : float
+        Stop merging once the best log Bayes factor falls at or below this
+        value.  ``-inf`` forces a full dendrogram down to a single cluster.
+    max_config : int or None
+        Skip (disallow) any merge whose joint configuration count would
+        exceed this cap, preventing combinatorial blow-up.  Defaults to
+        ``max(n_samples, 1000)``.
+
+    Returns
+    -------
+    dict with keys
+        ``clusters`` : list of list of int
+            The flat clustering at the automatic cut (marginal-product groups).
+        ``merges`` : list of (list, list, float)
+            Merge history as ``(cluster_a, cluster_b, log_bayes_factor)``.
+
+    References
+    ----------
+    Marrelec, G., Messé, A. & Bellec, P. (2015). "A Bayesian alternative to
+    mutual information for the hierarchical clustering of dependent random
+    variables." PLoS ONE 10(9): e0137278.
+    """
+    data = np.asarray(data, dtype=int)
+    cardinality = np.asarray(cardinality, dtype=int)
+    n_samples, n_vars = data.shape
+    if sample_weights is None:
+        weights = np.ones(n_samples, dtype=float)
+    else:
+        weights = np.asarray(sample_weights, dtype=float) * n_samples
+    if max_config is None:
+        max_config = max(n_samples, 1000)
+
+    clusters: List[List[int]] = [[v] for v in range(n_vars)]
+    log_ml: List[float] = [
+        _dirichlet_multinomial_log_ml(data, c, cardinality, alpha, weights)
+        for c in clusters
+    ]
+    config_size: List[int] = [int(cardinality[v]) for v in range(n_vars)]
+    merges: List[Tuple[List[int], List[int], float]] = []
+
+    while len(clusters) > 1:
+        best = (-np.inf, -1, -1)
+        best_joint_ml = 0.0
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                joint_size = config_size[i] * config_size[j]
+                if joint_size > max_config:
+                    continue
+                joint_vars = clusters[i] + clusters[j]
+                joint_ml = _dirichlet_multinomial_log_ml(
+                    data, joint_vars, cardinality, alpha, weights
+                )
+                log_bf = joint_ml - log_ml[i] - log_ml[j]
+                if log_bf > best[0]:
+                    best = (log_bf, i, j)
+                    best_joint_ml = joint_ml
+
+        log_bf, i, j = best
+        if i < 0 or log_bf <= stop_threshold:
+            break
+
+        merges.append((list(clusters[i]), list(clusters[j]), float(log_bf)))
+        merged = clusters[i] + clusters[j]
+        merged_size = config_size[i] * config_size[j]
+        # Remove j then i (j > i) and append the merged cluster.
+        for idx in (j, i):
+            clusters.pop(idx)
+            log_ml.pop(idx)
+            config_size.pop(idx)
+        clusters.append(merged)
+        log_ml.append(best_joint_ml)
+        config_size.append(merged_size)
+
+    return {"clusters": clusters, "merges": merges}
+
+
+# ===========================================================================
+# K2 variants  (docs/K2_Improvements — see K2_Improvements_Exploration.md)
+# ===========================================================================
+#
+# The classic K2 (``K2StructureLearner``) is a single greedy pass over a
+# *fixed* variable ordering.  Its accuracy is dominated by that ordering and
+# by the pool of candidate parents it considers.  The helpers and the
+# ``K2VariantLearner`` below bundle four cheap, high-leverage improvements
+# distilled from the papers in ``docs/K2_Improvements/``:
+#
+#   A. data-derived variable ordering  (order_method="mi")
+#   B. candidate-parent restriction    (parent_restriction="mi" | "mb")
+#   C. post-K2 refinement in DAG space (refine=True)
+#   D. order ensembling by edge voting (n_orderings>1)
+#
+# Every option keeps K2's low cost: none multiplies the base running time by
+# more than a small constant, well within the 10x budget.
+
+
+def _pairwise_mutual_information(
+    data: np.ndarray,
+    cardinality: np.ndarray,
+    sample_weights: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Return the symmetric pairwise mutual-information matrix (nats).
+
+    ``MI[i, j] = sum_{a,b} p(a,b) log( p(a,b) / (p(a) p(b)) )`` using the
+    (optionally weighted) empirical distribution.  Diagonal is zero.
+    """
+    data = np.asarray(data, dtype=int)
+    n_samples, n_vars = data.shape
+    if sample_weights is None:
+        w = np.ones(n_samples, dtype=float)
+    else:
+        w = np.asarray(sample_weights, dtype=float) * n_samples
+    wsum = w.sum()
+
+    # marginal distributions
+    marg = []
+    for v in range(n_vars):
+        c = np.bincount(data[:, v], weights=w, minlength=int(cardinality[v])).astype(float)
+        marg.append(c / wsum)
+
+    mi = np.zeros((n_vars, n_vars), dtype=float)
+    for i in range(n_vars):
+        ci = int(cardinality[i])
+        for j in range(i + 1, n_vars):
+            cj = int(cardinality[j])
+            joint_idx = data[:, i] * cj + data[:, j]
+            joint = np.bincount(joint_idx, weights=w, minlength=ci * cj).astype(float)
+            joint = (joint / wsum).reshape(ci, cj)
+            outer = np.outer(marg[i], marg[j])
+            mask = joint > 0
+            val = float(np.sum(joint[mask] * np.log(joint[mask] / outer[mask])))
+            mi[i, j] = mi[j, i] = max(val, 0.0)
+    return mi
+
+
+def _tarjan_scc(adj: np.ndarray) -> List[List[int]]:
+    """Tarjan's strongly-connected-components of a directed 0/1 matrix.
+
+    Returns the SCCs in reverse topological order of the condensation
+    (a component appears before its predecessors), matching Tarjan's
+    natural output order.
+    """
+    n = adj.shape[0]
+    index = [0]
+    idx = [-1] * n
+    low = [0] * n
+    on_stack = [False] * n
+    stack: List[int] = []
+    comps: List[List[int]] = []
+    succ = [np.where(adj[u] != 0)[0].tolist() for u in range(n)]
+
+    def strongconnect(v: int) -> None:
+        # iterative DFS to avoid recursion limits
+        work = [(v, 0)]
+        idx[v] = low[v] = index[0]; index[0] += 1
+        stack.append(v); on_stack[v] = True
+        while work:
+            node, pi = work[-1]
+            if pi < len(succ[node]):
+                work[-1] = (node, pi + 1)
+                w = succ[node][pi]
+                if idx[w] == -1:
+                    idx[w] = low[w] = index[0]; index[0] += 1
+                    stack.append(w); on_stack[w] = True
+                    work.append((w, 0))
+                elif on_stack[w]:
+                    low[node] = min(low[node], idx[w])
+            else:
+                if low[node] == idx[node]:
+                    comp = []
+                    while True:
+                        w = stack.pop(); on_stack[w] = False
+                        comp.append(w)
+                        if w == node:
+                            break
+                    comps.append(comp)
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    low[parent] = min(low[parent], low[node])
+
+    for v in range(n):
+        if idx[v] == -1:
+            strongconnect(v)
+    return comps
+
+
+def mi_variable_ordering(
+    data: np.ndarray,
+    n_vars: int,
+    cardinality: np.ndarray,
+    alpha: float = 1.0,
+    sample_weights: Optional[np.ndarray] = None,
+    top_m: Optional[int] = None,
+) -> np.ndarray:
+    """Derive a K2 variable ordering from data (Behjati & Beigy 2020).
+
+    1. Build a *sparse parent graph*: for each node keep the single best
+       parent (by K2 local-score gain) chosen among its highest-MI
+       candidates -> a directed graph of "best cause" edges.
+    2. Contract strongly-connected components (Tarjan).
+    3. Topologically sort the condensation (parents before children).
+    4. Order nodes inside each SCC by decreasing total MI (hubs first).
+
+    The result is a topological-ish ordering that puts likely root causes
+    early, which is exactly what K2 needs.  Cost is ``O(n^2 N)`` for the MI
+    matrix plus ``O(n * top_m)`` cheap score evaluations.
+    """
+    data = np.asarray(data, dtype=int)
+    mi = _pairwise_mutual_information(data, cardinality, sample_weights)
+    scoring = K2ScoringMethod(alpha=alpha, sample_weights=sample_weights)
+    if top_m is None:
+        top_m = min(n_vars - 1, max(5, n_vars // 2))
+
+    # 1. sparse parent graph: best single parent per node
+    directed = np.zeros((n_vars, n_vars), dtype=int)
+    for v in range(n_vars):
+        cand = np.argsort(-mi[v])
+        cand = [int(u) for u in cand if u != v][:top_m]
+        base = scoring.local_score(v, [], data, cardinality)
+        best_gain, best_u = 0.0, -1
+        for u in cand:
+            gain = scoring.local_score(v, [u], data, cardinality) - base
+            if gain > best_gain:
+                best_gain, best_u = gain, u
+        if best_u >= 0:
+            directed[best_u, v] = 1          # best_u is a parent (cause) of v
+
+    # 2-3. SCC condensation + topological order (Tarjan yields reverse topo)
+    comps = _tarjan_scc(directed)
+    comps = list(reversed(comps))            # now parents-before-children
+
+    # 4. within-SCC: hubs (high total MI) first
+    total_mi = mi.sum(axis=1)
+    order: List[int] = []
+    for comp in comps:
+        order.extend(sorted(comp, key=lambda x: -total_mi[x]))
+    return np.asarray(order, dtype=int)
+
+
+def mi_candidate_mask(
+    data: np.ndarray,
+    n_vars: int,
+    cardinality: np.ndarray,
+    top_k: int,
+    sample_weights: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Symmetric candidate-parent mask keeping each node's top-k MI neighbours.
+
+    Restricting K2's parent search to a small, data-driven neighbourhood
+    (the "brave/careful" candidate idea of BigBraveBN and the MI pre-screen
+    of Behjati 2020) removes spurious candidates -> better *and* faster.
+    """
+    mi = _pairwise_mutual_information(data, cardinality, sample_weights)
+    mask = np.zeros((n_vars, n_vars), dtype=int)
+    for v in range(n_vars):
+        nbrs = [int(u) for u in np.argsort(-mi[v]) if u != v and mi[v, u] > 0][:top_k]
+        for u in nbrs:
+            mask[v, u] = mask[u, v] = 1
+    return mask
+
+
+def elasticnet_candidate_mask(
+    data: np.ndarray,
+    n_vars: int,
+    cardinality: np.ndarray,
+    sample_weights: Optional[np.ndarray] = None,
+    l1_ratio: float = 0.5,
+    C: float = 0.5,
+) -> np.ndarray:
+    """Candidate-parent mask from elastic-net Markov blankets (Tabar 2025).
+
+    For each target, fit an elastic-net-penalised (L1+L2) multinomial
+    logistic regression on all other variables; predictors with a non-zero
+    coefficient group form the estimated Markov blanket.  The union
+    (symmetrised) is returned as an interaction mask for K2.  Falls back to
+    the MI mask if scikit-learn is unavailable.
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+    except ImportError:  # pragma: no cover
+        return mi_candidate_mask(data, n_vars, cardinality,
+                                 top_k=max(5, n_vars // 2),
+                                 sample_weights=sample_weights)
+    import warnings
+    data = np.asarray(data, dtype=int)
+    n_samples = data.shape[0]
+    w = None if sample_weights is None else np.asarray(sample_weights, float) * n_samples
+
+    # one-hot design for all variables once
+    blocks, span = [], []
+    start = 0
+    for v in range(n_vars):
+        k = int(cardinality[v])
+        cols = np.zeros((n_samples, k - 1), dtype=float)
+        for s in range(1, k):
+            cols[:, s - 1] = (data[:, v] == s)
+        blocks.append(cols)
+        span.append((start, start + k - 1))
+        start += k - 1
+    X_all = np.hstack(blocks) if blocks else np.zeros((n_samples, 0))
+
+    mask = np.zeros((n_vars, n_vars), dtype=int)
+    for v in range(n_vars):
+        y = data[:, v]
+        if np.unique(y).size < 2:
+            continue
+        cols_keep = [c for u in range(n_vars) if u != v
+                     for c in range(span[u][0], span[u][1])]
+        Xv = X_all[:, cols_keep]
+        model = LogisticRegression(penalty="elasticnet", l1_ratio=l1_ratio,
+                                   solver="saga", C=C, max_iter=200, tol=1e-3)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model.fit(Xv, y, sample_weight=w)
+        coef = np.abs(model.coef_).sum(axis=0)   # aggregate over classes
+        pos = 0
+        for u in range(n_vars):
+            if u == v:
+                continue
+            width = span[u][1] - span[u][0]
+            if width > 0 and coef[pos:pos + width].sum() > 1e-8:
+                mask[v, u] = mask[u, v] = 1
+            pos += width
+    return mask
+
+
+class K2VariantLearner:
+    """K2 with data-driven ordering, candidate pruning, refinement, ensembling.
+
+    A configurable superset of :class:`K2StructureLearner` gathering the most
+    feasible, high-impact improvements from ``docs/K2_Improvements/`` (see
+    ``K2_Improvements_Exploration.md``).  Every enhancement preserves K2's
+    speed to within a small constant factor.
+
+    Parameters
+    ----------
+    order_method : {"given", "mi"}
+        ``"given"`` uses the supplied ``permutation`` (classic K2).
+        ``"mi"`` derives a topological-ish ordering from data via
+        :func:`mi_variable_ordering` (Behjati & Beigy 2020; the single most
+        impactful change, since ordering dominates K2 accuracy).
+    parent_restriction : {None, "mi", "mb"}
+        Restrict candidate parents to a data-driven neighbourhood.
+        ``"mi"`` keeps each node's top-``mi_top_k`` mutual-information
+        neighbours; ``"mb"`` uses elastic-net Markov blankets (Tabar 2025).
+        Combined with any externally supplied ``interaction_matrix``.
+    refine : bool
+        After the K2 pass, polish the DAG with a bounded stable
+        hill-climb over add/delete/reverse moves (switch from ordering
+        space to DAG space, Xiang et al. 2024) to fix reversed/missing edges.
+    n_orderings : int
+        When > 1, run K2 from several orderings (the MI ordering plus
+        perturbations) and keep the edges that appear in a majority of the
+        resulting DAGs, breaking ties toward acyclicity — an order-robust
+        ensemble (Kitson & Constantinou 2024).
+    mi_top_k : int or None
+        Neighbourhood size for ``parent_restriction="mi"``.  ``None`` ->
+        ``max(2*max_parents, 10)``.
+    max_parents, alpha, limit_table_size, refine_max_iter, seed
+        Standard K2 / refinement controls.
+    """
+
+    def __init__(
+        self,
+        order_method: str = "mi",
+        parent_restriction: Optional[str] = "mi",
+        refine: bool = False,
+        n_orderings: int = 1,
+        max_parents: Optional[int] = None,
+        alpha: float = 1.0,
+        limit_table_size: bool = True,
+        mi_top_k: Optional[int] = None,
+        refine_max_iter: int = 100,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.order_method = order_method
+        self.parent_restriction = parent_restriction
+        self.refine = refine
+        self.n_orderings = n_orderings
+        self.max_parents = max_parents
+        self.alpha = alpha
+        self.limit_table_size = limit_table_size
+        self.mi_top_k = mi_top_k
+        self.refine_max_iter = refine_max_iter
+        self.seed = seed
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        ordering: Optional[np.ndarray] = None,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        data = np.asarray(data)
+        cardinality = np.asarray(cardinality, dtype=int)
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+        rng = np.random.default_rng(self.seed)
+
+        # ---- candidate-parent restriction (combine with any user mask) ----
+        inter = None if interaction_matrix is None else (np.asarray(interaction_matrix) != 0).astype(int)
+        if self.parent_restriction == "mi":
+            top_k = self.mi_top_k if self.mi_top_k is not None else max(2 * mp, 10)
+            top_k = min(top_k, n_vars - 1)
+            m = mi_candidate_mask(data, n_vars, cardinality, top_k, sample_weights)
+            inter = m if inter is None else (inter & m)
+        elif self.parent_restriction == "mb":
+            m = elasticnet_candidate_mask(data, n_vars, cardinality, sample_weights)
+            inter = m if inter is None else (inter & m)
+
+        # ---- base ordering ------------------------------------------------
+        if self.order_method == "mi":
+            base_order = mi_variable_ordering(
+                data, n_vars, cardinality, self.alpha, sample_weights,
+                top_m=self.mi_top_k,
+            )
+        elif permutation is not None:
+            base_order = np.asarray(permutation, dtype=int)
+        elif ordering is not None:
+            base_order = np.asarray(ordering, dtype=int)
+        else:
+            base_order = np.arange(n_vars, dtype=int)
+
+        k2 = K2StructureLearner(max_parents=mp, alpha=self.alpha,
+                                limit_table_size=self.limit_table_size)
+
+        def run(order):
+            return k2.learn(data, n_vars, cardinality, permutation=order,
+                            interaction_matrix=inter, sample_weights=sample_weights)
+
+        # ---- single order or order-ensemble -------------------------------
+        if self.n_orderings <= 1:
+            adjacency = run(base_order)
+        else:
+            orders = [base_order]
+            for _ in range(self.n_orderings - 1):
+                orders.append(rng.permutation(n_vars))
+            votes = np.zeros((n_vars, n_vars), dtype=float)
+            for o in orders:
+                votes += run(o)
+            adjacency = self._vote_to_dag(votes, len(orders), mp)
+
+        # ---- optional DAG-space refinement --------------------------------
+        if self.refine:
+            adjacency = self._refine(adjacency, data, n_vars, cardinality,
+                                     mp, inter, sample_weights)
+        return adjacency
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _vote_to_dag(votes: np.ndarray, n_runs: int, mp: int) -> np.ndarray:
+        """Keep majority-voted directed edges, inserting greedily & acyclically."""
+        n = votes.shape[0]
+        cand = []
+        for u in range(n):
+            for v in range(n):
+                if u != v and votes[u, v] > 0:
+                    cand.append((votes[u, v], u, v))
+        cand.sort(key=lambda t: (t[0], -t[1], -t[2]), reverse=True)
+        adj = np.zeros((n, n), dtype=int)
+        half = n_runs / 2.0
+        for cnt, u, v in cand:
+            if cnt < half:                    # majority rule
+                continue
+            if adj[v, u] == 1:                # opposite already placed
+                continue
+            if int(adj[:, v].sum()) >= mp:
+                continue
+            if not _would_create_cycle(adj, u, v):
+                adj[u, v] = 1
+        return adj
+
+    def _refine(self, adjacency, data, n_vars, cardinality, mp, inter, sample_weights):
+        """Seed a stable hill-climb with the K2 graph and polish it."""
+        scorer = K2ScoringMethod(alpha=self.alpha, sample_weights=sample_weights)
+        hc = StableHillClimbLearner(scoring=scorer, max_parents=mp,
+                                    max_iter=self.refine_max_iter,
+                                    limit_table_size=self.limit_table_size)
+        # StableHillClimbLearner starts from empty; emulate a warm start by
+        # scoring add/del/reverse from the K2 graph via a short local search.
+        return _hill_climb_from(adjacency, data, n_vars, cardinality, scorer,
+                                mp, inter, self.limit_table_size,
+                                self.refine_max_iter)
+
+
+def _hill_climb_from(
+    adjacency: np.ndarray,
+    data: np.ndarray,
+    n_vars: int,
+    cardinality: np.ndarray,
+    scorer: ScoringMethod,
+    mp: int,
+    interaction_matrix: Optional[np.ndarray],
+    limit_table_size: bool,
+    max_iter: int,
+) -> np.ndarray:
+    """Warm-started stable hill-climb (add/delete/reverse) from *adjacency*.
+
+    Deterministic tie-breaking (Kitson & Constantinou 2024) via ``_op_key``.
+    """
+    n_samples = data.shape[0]
+    adj = adjacency.copy()
+    cache: dict = {}
+
+    def local(var, parents):
+        key = (var, tuple(sorted(parents)))
+        if key not in cache:
+            cache[key] = scorer.local_score(var, list(parents), data, cardinality)
+        return cache[key]
+
+    def parents_of(v):
+        return list(np.where(adj[:, v] > 0)[0])
+
+    def allowed(u, v):
+        return interaction_matrix is None or interaction_matrix[u, v] != 0
+
+    for _ in range(max_iter):
+        best_key, best_op = None, None
+        for u in range(n_vars):
+            for v in range(n_vars):
+                if u == v:
+                    continue
+                pa_v = parents_of(v)
+                if adj[u, v] == 0 and adj[v, u] == 0 and allowed(u, v):
+                    if len(pa_v) < mp and not _would_create_cycle(adj, u, v):
+                        new_pa = pa_v + [u]
+                        if not limit_table_size or _joint_table_size(cardinality, [v] + new_pa) <= n_samples:
+                            delta = local(v, new_pa) - local(v, pa_v)
+                            k = _op_key(delta, "add", u, v)
+                            if best_key is None or k > best_key:
+                                best_key, best_op = k, ("add", u, v)
+                if adj[u, v] == 1:
+                    new_pa = [p for p in pa_v if p != u]
+                    delta = local(v, new_pa) - local(v, pa_v)
+                    k = _op_key(delta, "del", u, v)
+                    if best_key is None or k > best_key:
+                        best_key, best_op = k, ("del", u, v)
+                    # reverse u->v  =>  v->u
+                    pa_u = parents_of(u)
+                    if allowed(v, u) and len(pa_u) < mp:
+                        tmp = adj.copy(); tmp[u, v] = 0
+                        if not _would_create_cycle(tmp, v, u):
+                            new_pa_v = [p for p in pa_v if p != u]
+                            new_pa_u = pa_u + [v]
+                            if not limit_table_size or _joint_table_size(cardinality, [u] + new_pa_u) <= n_samples:
+                                delta = (local(v, new_pa_v) - local(v, pa_v)
+                                         + local(u, new_pa_u) - local(u, pa_u))
+                                k = _op_key(delta, "rev", u, v)
+                                if best_key is None or k > best_key:
+                                    best_key, best_op = k, ("rev", u, v)
+        if best_op is None or best_key[0] <= 1e-10:
+            break
+        op, u, v = best_op
+        if op == "add":
+            adj[u, v] = 1
+        elif op == "del":
+            adj[u, v] = 0
+        else:
+            adj[u, v] = 0; adj[v, u] = 1
+    return adj
+
+
+# ===========================================================================
+# Objective-guided K2 orderings and an independent baseline
+# ===========================================================================
+#
+# In an EDA the Bayesian network is learned from a *selected* population whose
+# rows carry a per-solution probability (``sample_weights``), derived from the
+# objective value.  The three learners below exploit (or deliberately ignore)
+# that signal:
+#
+#   * ``IndependentBNLearner`` (Univ_BN) — empty graph baseline: every
+#     variable is marginally independent, only the univariate tables are fit.
+#   * ``FeatureImportanceK2Learner`` (FI_k2) — order K2's variables by their
+#     univariate predictive power for the solution probability.
+#   * ``RFEK2Learner`` (RFE_k2) — order K2's variables by a recursive /
+#     minimum-redundancy criterion so that each new variable adds information
+#     about the solution probability beyond the variables already placed.
+
+
+class IndependentBNLearner:
+    """Univ_BN — the fully independent (empty-graph) baseline.
+
+    Learns *no* structure: the returned adjacency matrix is all zeros, so
+    every variable is a root and :meth:`BayesianNetwork.learn_parameters`
+    fits only the univariate marginal probability tables.  Useful as a
+    lower-bound reference against which structure-learning methods are
+    compared (a product-of-marginals / univariate model, as used by the
+    simplest EDAs such as UMDA/PBIL).
+    """
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        return np.zeros((n_vars, n_vars), dtype=int)
+
+
+def _solution_probability_target(
+    sample_weights: Optional[np.ndarray],
+    n_samples: int,
+) -> Optional[np.ndarray]:
+    """Return the per-solution probability used as the feature-selection target.
+
+    The target is the ``sample_weights`` vector (the probability computed from
+    each solution's objective value).  Returns ``None`` when no usable signal
+    is available (weights missing or all equal), so callers can fall back to a
+    neutral ordering.
+    """
+    if sample_weights is None:
+        return None
+    y = np.asarray(sample_weights, dtype=float).reshape(-1)
+    if y.shape[0] != n_samples:
+        raise ValueError("sample_weights length must match the number of rows")
+    if not np.any(np.abs(y - y[0]) > 1e-15):      # constant target => no signal
+        return None
+    return y
+
+
+def _rank_desc_with_random_ties(
+    importance: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Argsort *importance* descending, breaking ties uniformly at random."""
+    importance = np.asarray(importance, dtype=float)
+    importance = np.where(np.isfinite(importance), importance, -np.inf)
+    tie_break = rng.random(importance.shape[0])
+    # np.lexsort: last key is primary.  Primary = -importance (ascending on the
+    # negative == descending on importance); secondary = random tie-break.
+    return np.lexsort((tie_break, -importance))
+
+
+def feature_importance_ordering(
+    data: np.ndarray,
+    solution_prob: Optional[np.ndarray],
+    method: str = "mutual_info",
+    seed: Optional[int] = None,
+) -> np.ndarray:
+    """Rank variables by univariate predictive power for the solution probability.
+
+    Computes, for every variable independently, an importance score measuring
+    how well it predicts ``solution_prob`` and returns the permutation that
+    places the most important variable first (ties broken at random).  This is
+    the ordering used by **FI_k2**.
+
+    Parameters
+    ----------
+    data : np.ndarray, shape (n_samples, n_vars)
+        The (integer-coded) solutions.
+    solution_prob : np.ndarray or None
+        Per-solution probability target (``sample_weights``).  If ``None`` or
+        constant, a uniformly random permutation is returned.
+    method : {"mutual_info", "f_regression", "r_regression"}
+        scikit-learn univariate importance measure.
+        ``"mutual_info"`` uses :func:`sklearn.feature_selection.mutual_info_regression`
+        with ``discrete_features=True`` (captures non-linear dependence);
+        ``"f_regression"`` uses the F-statistic; ``"r_regression"`` uses the
+        absolute Pearson correlation.
+    seed : int or None
+        Seed for tie-breaking (and the MI estimator's internal randomness).
+
+    Returns
+    -------
+    np.ndarray
+        A permutation of ``[0 … n_vars-1]``.
+    """
+    data = np.asarray(data)
+    n_samples, n_vars = data.shape
+    rng = np.random.default_rng(seed)
+
+    y = _solution_probability_target(solution_prob, n_samples)
+    if y is None:
+        return rng.permutation(n_vars)
+
+    X = data.astype(float)
+    name = method.lower()
+    if name in ("mutual_info", "mutual_info_regression", "mi"):
+        from sklearn.feature_selection import mutual_info_regression
+        importance = mutual_info_regression(
+            X, y, discrete_features=True, random_state=int(rng.integers(1 << 31))
+        )
+    elif name in ("f_regression", "f"):
+        from sklearn.feature_selection import f_regression
+        f_stat, _ = f_regression(X, y)
+        importance = np.nan_to_num(f_stat, nan=0.0, posinf=0.0, neginf=0.0)
+    elif name in ("r_regression", "r", "pearson"):
+        from sklearn.feature_selection import r_regression
+        importance = np.abs(np.nan_to_num(r_regression(X, y), nan=0.0))
+    else:
+        raise ValueError(
+            "method must be 'mutual_info', 'f_regression', or 'r_regression'"
+        )
+
+    return _rank_desc_with_random_ties(importance, rng)
+
+
+def rfe_ordering(
+    data: np.ndarray,
+    solution_prob: Optional[np.ndarray],
+    cardinality: np.ndarray,
+    selector: str = "mrmr",
+    seed: Optional[int] = None,
+    sample_weights: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Recursive / minimum-redundancy ordering of variables for **RFE_k2**.
+
+    Unlike :func:`feature_importance_ordering`, the importance of a variable
+    here is judged *conditionally* on the variables already placed, so
+    redundant variables are pushed back.
+
+    Two strategies are provided:
+
+    ``selector="mrmr"`` (default)
+        Greedy minimum-Redundancy-Maximum-Relevance forward selection.  The
+        first variable is the one with the highest mutual information with the
+        solution probability (relevance).  Each subsequent variable maximises
+        ``relevance − mean redundancy``, where redundancy is the mean
+        mutual information with the variables already selected.  This directly
+        realises "add the most informative variable, then the one that adds
+        most while overlapping least with those already chosen".
+
+    ``selector="rfe"``
+        scikit-learn :class:`~sklearn.feature_selection.RFE` with a random
+        forest estimator predicting the solution probability.  Variables are
+        ordered by RFE's elimination ranking: the last variable kept comes
+        first, the first variable eliminated comes last.
+
+    Parameters
+    ----------
+    data : np.ndarray, shape (n_samples, n_vars)
+    solution_prob : np.ndarray or None
+        Per-solution probability target.  If ``None``/constant a uniformly
+        random permutation is returned.
+    cardinality : np.ndarray
+        Needed for the feature–feature mutual-information (redundancy) matrix.
+    selector : {"mrmr", "rfe"}
+    seed : int or None
+    sample_weights : np.ndarray or None
+        Weights for the feature–feature MI matrix (defaults to ``solution_prob``).
+
+    Returns
+    -------
+    np.ndarray
+        A permutation of ``[0 … n_vars-1]``.
+    """
+    data = np.asarray(data)
+    n_samples, n_vars = data.shape
+    cardinality = np.asarray(cardinality, dtype=int)
+    rng = np.random.default_rng(seed)
+
+    y = _solution_probability_target(solution_prob, n_samples)
+    if y is None:
+        return rng.permutation(n_vars)
+
+    name = selector.lower()
+    if name == "rfe":
+        return _rfe_sklearn_ordering(data, y, rng)
+    if name != "mrmr":
+        raise ValueError("selector must be 'mrmr' or 'rfe'")
+
+    # ---- mRMR greedy forward selection -------------------------------------
+    from sklearn.feature_selection import mutual_info_regression
+    relevance = mutual_info_regression(
+        data.astype(float), y, discrete_features=True,
+        random_state=int(rng.integers(1 << 31)),
+    )
+    # feature-feature MI (redundancy); reuse the weighted MI matrix helper.
+    ff_mi = _pairwise_mutual_information(
+        data, cardinality,
+        sample_weights if sample_weights is not None else None,
+    )
+
+    remaining = list(range(n_vars))
+    # first variable: maximum relevance (random tie-break)
+    first = int(_rank_desc_with_random_ties(relevance, rng)[0])
+    order = [first]
+    remaining.remove(first)
+
+    while remaining:
+        rem = np.array(remaining)
+        redundancy = ff_mi[np.ix_(rem, order)].mean(axis=1)
+        score = relevance[rem] - redundancy
+        # rank remaining by score desc with random ties, take the best
+        best_local = int(_rank_desc_with_random_ties(score, rng)[0])
+        nxt = int(rem[best_local])
+        order.append(nxt)
+        remaining.remove(nxt)
+
+    return np.asarray(order, dtype=int)
+
+
+def _rfe_sklearn_ordering(
+    data: np.ndarray,
+    y: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Permutation from scikit-learn RFE (kept-longest first, eliminated last)."""
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.feature_selection import RFE
+
+    est = RandomForestRegressor(
+        n_estimators=100, random_state=int(rng.integers(1 << 31)), n_jobs=1
+    )
+    rfe = RFE(est, n_features_to_select=1, step=1)
+    rfe.fit(data.astype(float), y)
+    # ranking_ == 1 for the last-surviving feature; larger == eliminated earlier.
+    # Ascending ranking => most important (kept longest) first.
+    ranking = np.asarray(rfe.ranking_, dtype=float)
+    tie_break = rng.random(ranking.shape[0])
+    return np.lexsort((tie_break, ranking))
+
+
+class FeatureImportanceK2Learner:
+    """FI_k2 — K2 seeded with a univariate feature-importance ordering.
+
+    Ranks the variables by how well each one predicts the per-solution
+    probability (``sample_weights``) using a scikit-learn univariate measure
+    (:func:`feature_importance_ordering`), then runs classic K2 with that
+    permutation.  The most predictive variable is placed first so it may act
+    as a parent of the rest.
+
+    Parameters
+    ----------
+    importance : {"mutual_info", "f_regression", "r_regression"}
+        Univariate importance measure.
+    max_parents, alpha, limit_table_size
+        Standard K2 controls.
+    seed : int or None
+        Seed for random tie-breaking.
+    """
+
+    def __init__(
+        self,
+        importance: str = "mutual_info",
+        max_parents: Optional[int] = None,
+        alpha: float = 1.0,
+        limit_table_size: bool = True,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.importance = importance
+        self.max_parents = max_parents
+        self.alpha = alpha
+        self.limit_table_size = limit_table_size
+        self.seed = seed
+        self.ordering_: Optional[np.ndarray] = None
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        order = feature_importance_ordering(
+            data, sample_weights, method=self.importance, seed=self.seed
+        )
+        self.ordering_ = order
+        return K2StructureLearner(
+            max_parents=self.max_parents,
+            alpha=self.alpha,
+            limit_table_size=self.limit_table_size,
+        ).learn(
+            data, n_vars, cardinality,
+            permutation=order,
+            interaction_matrix=interaction_matrix,
+            sample_weights=sample_weights,
+        )
+
+
+class RFEK2Learner:
+    """RFE_k2 — K2 seeded with a recursive / min-redundancy ordering.
+
+    Ranks variables by their *conditional* contribution to predicting the
+    per-solution probability (:func:`rfe_ordering`): each variable added to
+    the ordering is the one that best explains the solution probability while
+    overlapping least with the variables already placed.  K2 is then run with
+    that permutation.
+
+    Parameters
+    ----------
+    selector : {"mrmr", "rfe"}
+        ``"mrmr"`` (default) uses greedy minimum-redundancy-maximum-relevance
+        forward selection; ``"rfe"`` uses scikit-learn recursive feature
+        elimination with a random-forest estimator.
+    max_parents, alpha, limit_table_size
+        Standard K2 controls.
+    seed : int or None
+        Seed for random tie-breaking / estimator randomness.
+    """
+
+    def __init__(
+        self,
+        selector: str = "mrmr",
+        max_parents: Optional[int] = None,
+        alpha: float = 1.0,
+        limit_table_size: bool = True,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.selector = selector
+        self.max_parents = max_parents
+        self.alpha = alpha
+        self.limit_table_size = limit_table_size
+        self.seed = seed
+        self.ordering_: Optional[np.ndarray] = None
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        order = rfe_ordering(
+            data, sample_weights, cardinality,
+            selector=self.selector, seed=self.seed,
+            sample_weights=sample_weights,
+        )
+        self.ordering_ = order
+        return K2StructureLearner(
+            max_parents=self.max_parents,
+            alpha=self.alpha,
+            limit_table_size=self.limit_table_size,
+        ).learn(
+            data, n_vars, cardinality,
+            permutation=order,
+            interaction_matrix=interaction_matrix,
+            sample_weights=sample_weights,
+        )

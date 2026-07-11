@@ -67,6 +67,15 @@ LEARNING_METHODS = [
     dict(name="RPCD",       method="rpcd",        kwargs={}),
     dict(name="PC",         method="pc",          kwargs={}),
     dict(name="Stable-PC",  method="stable_pc",   kwargs={}),
+    # ── Markov-blanket / decomposition-based ───────────────────────────
+    dict(name="DMBBN",      method="dmbbn",       kwargs={}),
+    dict(name="iter-DSLA",  method="iterdsla",    kwargs={}),
+    # ── Differentiable (binary benchmarks only; errors are caught) ──────
+    dict(name="BINOTEARS",  method="binotears",   kwargs={}),
+    # NOTE: 'levelwise'/'exact' (LevelWiseDPLearner) is optimal but
+    # exponential — enable it only on small benchmarks (n_vars <= ~18).
+    # 'sartre' (SARTREPruner) needs a good topological order; chain it
+    # after an order-estimating learner rather than running it stand-alone.
 ]
 
 # The 10 benchmarks (same list as generate_bn_datasets.py)

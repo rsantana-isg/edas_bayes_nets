@@ -201,6 +201,11 @@ class BayesianNetwork:
         permutation: Optional[np.ndarray] = None,
         interaction_matrix: Optional[np.ndarray] = None,
         sample_weights: Optional[np.ndarray] = None,
+        treewidth_bound: int = 2,
+        n_ktrees: int = 100,
+        seed: Optional[int] = None,
+        fs_importance: str = "mutual_info",
+        rfe_selector: str = "mrmr",
     ) -> "BayesianNetwork":
         """Learn the DAG structure from *data*.
 
@@ -240,6 +245,27 @@ class BayesianNetwork:
                 limit_table_size=limit_table_size,
             )
             self.adjacency = learner.learn(data, self.n_vars, self.cardinality, **learn_kwargs)
+
+        elif method in ("k2_mi", "k2_mb", "k2_refine", "k2_ensemble", "k2_plus"):
+            from bayes_nets.structure_learning import K2VariantLearner
+            # Named presets that layer the K2 improvements (see
+            # K2_Improvements_Exploration.md).  All stay within ~5x base K2 time.
+            presets = {
+                "k2_mi":       dict(order_method="mi", parent_restriction=None),
+                "k2_mb":       dict(order_method="given", parent_restriction="mb"),
+                "k2_refine":   dict(order_method="mi", parent_restriction="mi", refine=True),
+                "k2_ensemble": dict(order_method="mi", parent_restriction="mi", n_orderings=5),
+                "k2_plus":     dict(order_method="mi", parent_restriction="mi", refine=True),
+            }
+            learner = K2VariantLearner(
+                max_parents=max_parents, alpha=alpha,
+                limit_table_size=limit_table_size, **presets[method],
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm, interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
 
         elif method in ("bic", "aic"):
             scoring_cls = BICScoringMethod if method == "bic" else AICScoringMethod
@@ -332,12 +358,134 @@ class BayesianNetwork:
                 sample_weights=sample_weights,
             )
 
+        elif method == "dmbbn":
+            from bayes_nets.structure_learning import DMBBNStructureLearner
+            learner = DMBBNStructureLearner(
+                max_parents=max_parents,
+                alpha=alpha,
+                limit_table_size=limit_table_size,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method in ("levelwise", "exact"):
+            from bayes_nets.structure_learning import LevelWiseDPLearner
+            learner = LevelWiseDPLearner(
+                score="bic",
+                alpha=alpha,
+                max_parents=max_parents,
+                limit_table_size=limit_table_size,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method == "sartre":
+            from bayes_nets.structure_learning import SARTREPruner
+            learner = SARTREPruner(max_parents=max_parents)
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method in ("iterdsla", "iter_dsla"):
+            from bayes_nets.structure_learning import IterDSLALearner
+            learner = IterDSLALearner(
+                score="bic",
+                alpha=alpha,
+                max_parents=max_parents,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method == "binotears":
+            from bayes_nets.notears import BinaryNotearsLearner
+            learner = BinaryNotearsLearner(max_parents=max_parents)
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method in ("bounded_tw", "bounded_treewidth", "ktree"):
+            from bayes_nets.structure_learning import BoundedTreewidthLearner
+            learner = BoundedTreewidthLearner(
+                k=treewidth_bound,
+                n_ktrees=n_ktrees,
+                score="bic",
+                alpha=alpha,
+                max_parents=max_parents,
+                limit_table_size=limit_table_size,
+                seed=seed,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method in ("univ_bn", "univ", "independent"):
+            from bayes_nets.structure_learning import IndependentBNLearner
+            learner = IndependentBNLearner()
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method in ("fi_k2", "fik2"):
+            from bayes_nets.structure_learning import FeatureImportanceK2Learner
+            learner = FeatureImportanceK2Learner(
+                importance=fs_importance,
+                max_parents=max_parents,
+                alpha=alpha,
+                limit_table_size=limit_table_size,
+                seed=seed,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method in ("rfe_k2", "rfek2"):
+            from bayes_nets.structure_learning import RFEK2Learner
+            learner = RFEK2Learner(
+                selector=rfe_selector,
+                max_parents=max_parents,
+                alpha=alpha,
+                limit_table_size=limit_table_size,
+                seed=seed,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
         else:
             raise ValueError(
                 f"Unknown method '{method}'. "
-                "Choose 'bic', 'aic', 'k2', 'stable_hc', 'tabu', "
+                "Choose 'bic', 'aic', 'k2', "
+                "'k2_mi'/'k2_mb'/'k2_refine'/'k2_ensemble'/'k2_plus', "
+                "'stable_hc', 'tabu', "
                 "'gs', 'rcd', 'rpcd', 'pc', 'stable_pc', "
-                "'dt'/'decision_tree', or 'dg'/'decision_graph'."
+                "'dt'/'decision_tree', 'dg'/'decision_graph', "
+                "'dmbbn', 'levelwise'/'exact', 'sartre', "
+                "'iterdsla', 'binotears', 'bounded_tw', "
+                "'univ_bn', 'fi_k2', or 'rfe_k2'."
             )
 
         self.cpds = {}
@@ -349,6 +497,7 @@ class BayesianNetwork:
         alpha: float = 1.0,
         *,
         sample_weights: Optional[np.ndarray] = None,
+        parameter_learner=None,
     ) -> "BayesianNetwork":
         """Estimate CPDs from *data* given the current structure.
 
@@ -356,19 +505,72 @@ class BayesianNetwork:
         ----------
         data : np.ndarray, shape (n_samples, n_vars)
         alpha : float
-            Dirichlet/Laplace smoothing.
+            Dirichlet/Laplace smoothing (used by the default MLE learner).
         sample_weights : array of float, shape (n_samples,), optional
             Probability vector (must sum to 1).
+        parameter_learner : object, optional
+            A parameter learner exposing ``learn(data, n_vars, cardinality,
+            adjacency, sample_weights=...)`` and returning the CPD dict.
+            Defaults to :class:`MLEParameterLearner`.  Pass a
+            :class:`LogisticRegressionParameterLearner` to use the
+            regression-based CPD estimator for dense networks.
         """
         from bayes_nets.parameter_learning import MLEParameterLearner
 
         data = np.asarray(data, dtype=int)
-        learner = MLEParameterLearner(alpha=alpha)
+        learner = parameter_learner if parameter_learner is not None else MLEParameterLearner(alpha=alpha)
         self.cpds = learner.learn(
             data, self.n_vars, self.cardinality, self.adjacency,
             sample_weights=sample_weights,
         )
         return self
+
+    def learn_variable_clustering(
+        self,
+        data: np.ndarray,
+        *,
+        alpha: float = 1.0,
+        stop_threshold: float = 0.0,
+        max_config: Optional[int] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> dict:
+        """Cluster variables into a linkage tree via Bayesian model comparison.
+
+        Returns the flat marginal-product clustering and the merge history
+        (see :func:`bayes_nets.structure_learning.bayesian_variable_clustering`).
+        This does not modify the network structure; it produces an informative
+        variable grouping useful for EDA linkage / marginal-product sampling.
+
+        References
+        ----------
+        Marrelec, Messé & Bellec (2015), PLoS ONE 10(9): e0137278.
+        """
+        from bayes_nets.structure_learning import bayesian_variable_clustering
+
+        data = np.asarray(data, dtype=int)
+        return bayesian_variable_clustering(
+            data, self.cardinality,
+            sample_weights=sample_weights,
+            alpha=alpha,
+            stop_threshold=stop_threshold,
+            max_config=max_config,
+        )
+
+    def to_circuit(self, method: str = "min-fill"):
+        """Compile the network into a tractable arithmetic circuit / SPN.
+
+        The returned :class:`bayes_nets.circuits.ArithmeticCircuit` answers
+        marginal, MPE and sampling queries exactly in time linear in the
+        circuit size.  Requires CPDs (call :meth:`fit` /
+        :meth:`learn_parameters` first).
+
+        References
+        ----------
+        Vergari, Di Mauro & Esposito (2016), Machine Learning 108, 551-573.
+        """
+        from bayes_nets.circuits import ArithmeticCircuit
+
+        return ArithmeticCircuit.from_bayesian_network(self, method=method)
 
     # ------------------------------------------------------------------
     # Sampling
