@@ -1,16 +1,54 @@
-Metadata-Version: 2.4
+Metadata-Version: 2.2
 Name: bayes_nets
 Version: 0.1.0
 Summary: Discrete Bayesian network learning, sampling, and visualization
+Author-email: Roberto Santana <roberto.santana@ehu.eus>
+License: MIT License
+        
+        Copyright (c) 2025 Roberto Santana
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Project-URL: Homepage, https://github.com/rsantana-isg/edas_bayes_nets
+Project-URL: Repository, https://github.com/rsantana-isg/edas_bayes_nets
+Project-URL: Issues, https://github.com/rsantana-isg/edas_bayes_nets/issues
+Keywords: Bayesian networks,probabilistic graphical models,structure learning,parameter learning,sampling,estimation of distribution algorithms,EDA
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
-Requires-Dist: numpy
-Requires-Dist: scipy
+License-File: LICENSE
+Requires-Dist: numpy>=1.21
+Requires-Dist: scipy>=1.7
 Provides-Extra: viz
-Requires-Dist: matplotlib; extra == "viz"
-Requires-Dist: networkx; extra == "viz"
+Requires-Dist: matplotlib>=3.4; extra == "viz"
+Requires-Dist: networkx>=3.0; extra == "viz"
 Provides-Extra: dev
-Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest>=7; extra == "dev"
+Requires-Dist: pytest-cov>=3; extra == "dev"
 
 # bayes_nets
 
@@ -148,6 +186,72 @@ Unconstrained greedy hill-climbing with BIC or AIC scoring.  No ordering needed;
 bn.learn_structure(data, method="bic", max_parents=3)
 ```
 
+### Polytree (singly connected) learners
+
+A **polytree** is a DAG whose skeleton has no undirected cycle, so at most one
+path connects any two variables.  Polytrees admit exact linear-time inference
+and need far fewer samples than general BNs, which is why they are the model
+class of the Polytree Approximation Distribution Algorithm (PADA / FDA-SC).
+These learners live in `bayes_nets/polytree_learning.py` and were implemented
+from the papers in `docs/PADA/`:
+
+| Method | Class / `method=` | Paper |
+|--------|-------------------|-------|
+| **Chow-Liu branching** — max-weight spanning forest over mutual information; a provably bounded approximation to the optimal polytree | `ChowLiuTreeLearner` / `"chow_liu"` | Chow & Liu (1968); Dasgupta (1999) |
+| **Rebane-Pearl** — Chow-Liu skeleton + collider orientation from marginal independence | `RebanePearlPolytreeLearner` / `"rebane_pearl"` | Rebane & Pearl (1987) |
+| **LPA** — edges ranked by the global dependency degree `DepG(a,b) = min(Dep(a,b), min_c Dep(a,b|c))`, oriented by comparing dependency before/after instantiating the middle node | `PolytreeLPALearner` / `"lpa"`, `"lpa_marginal"` | Ochoa, Mühlenbein & Soto (2000) |
+| **Sheaf-based causal polytree** — incremental node insertion using only marginal and first-order CI tests, O(n²) | `CausalPolytreeLearner` / `"causal_polytree"` | Huete & de Campos (1993) |
+
+```python
+# LPA, the learner used inside PADA / FDA-SC
+bn.learn_structure(data, method="lpa", alpha=0.05)
+
+# quadratic variant: rank by marginal dependency only
+bn.learn_structure(data, method="lpa_marginal")
+```
+
+All four guarantee a singly connected result. `alpha` sets the significance
+level of the independence tests; the LPA thresholds `e0`/`e1` are derived from
+it and scale as `1/N`, reproducing the population-size dependence the PADA
+paper requires.  `"chow_liu"` restricts every node to a single parent
+(a *branching*); the other three can represent head-to-head patterns.
+
+Note that a pure XOR-style collider is invisible to any of these learners:
+each parent is then *marginally* independent of the child, so no pairwise
+dependency measure can place the edge (Dasgupta 1999, Example 2).
+
+### Advanced learners from the recent literature
+
+These learners were implemented from the papers surveyed in
+[`Other_BN_Papers_Ranked.md`](Other_BN_Papers_Ranked.md) (sources in
+`docs/Other_BN_Structure_Learning_Methods/`).  Each is available both as a
+class and through `learn_structure(method=...)`:
+
+| Method | Class / `method=` | Paper |
+|--------|-------------------|-------|
+| **DMBBN** — order-free Markov-blanket learning + Kruskal combination | `DMBBNStructureLearner` / `"dmbbn"` | Carvalho Dâmaso et al. (2026) |
+| **iter-DSLA** — iterative divide-and-conquer with community decomposition and SELECT/AND/OR mutation operators | `IterDSLALearner` / `"iterdsla"` | Jia & Li (2026) |
+| **SARTRE** — order-based edge pruning via group-lasso sparse regression | `SARTREPruner` / `"sartre"` | Kanamori et al. (2026) |
+| **Level-wise DP** — memory-efficient *exact* structure learning over the subset lattice | `LevelWiseDPLearner` / `"levelwise"` | Huang & Suzuki (2026) |
+| **BINOTEARS** — differentiable (NOTEARS-style) structure learning for binary data | `BinaryNotearsLearner` / `"binotears"` | Deng & Aragam (2025) |
+
+```python
+# order-free Markov-blanket learner
+bn.learn_structure(data, method="dmbbn", max_parents=3)
+
+# iterative decomposition learner for large networks
+bn.learn_structure(data, method="iterdsla", max_parents=3)
+
+# exact optimum for small problems (n_vars <= ~18)
+bn.learn_structure(data, method="levelwise")
+
+# prune a fully-connected DAG given a topological order
+bn.learn_structure(data, method="sartre", permutation=order)
+
+# differentiable learner for binary data
+bn.learn_structure(binary_data, method="binotears")
+```
+
 ---
 
 ## Parameter learning
@@ -159,6 +263,21 @@ bn.learn_parameters(data, alpha=1.0)   # Laplace smoothing
 ```
 
 For a root variable the CPD is a 1-D probability vector.  For a variable with parents it is a 2-D array of shape `(n_parent_configs, cardinality[var])`.
+
+### `LogisticRegressionParameterLearner`
+
+An alternative CPD estimator that fits each node with an **L1-regularised
+multinomial logistic regression** over parent-derived features (dummy
+encodings plus optional pairwise XOR interactions), following Moral et al.
+(2026).  The number of effective parameters grows *linearly* with the number
+of parents instead of exponentially, which helps in dense networks; it is a
+drop-in replacement for the MLE learner:
+
+```python
+from bayes_nets import LogisticRegressionParameterLearner
+
+bn.learn_parameters(data, parameter_learner=LogisticRegressionParameterLearner(C=5.0))
+```
 
 ---
 
@@ -224,3 +343,14 @@ def learn_bn_model(data: np.ndarray, cardinality: np.ndarray, **kwargs):
 * Pelikan, M., Goldberg, D. E., & Cantú-Paz, E. (1999). BOA: The Bayesian Optimization Algorithm. *GECCO 1999*, pp. 525–532.
 * Schwarz, G. (1978). Estimating the dimension of a model. *Annals of Statistics*, 6(2), 461–464.
 * Akaike, H. (1974). A new look at the statistical model identification. *IEEE Transactions on Automatic Control*, 19(6), 716–723.
+
+### Recent structure- and parameter-learning methods
+
+* Carvalho Dâmaso, A., et al. (2026). Learning Bayesian Network Structures Without Variable Ordering Influence: A Markov Blanket-Based Approach. *Computational Intelligence*. — `DMBBNStructureLearner`
+* Jia, X., & Li, Z. (2026). An iterative structure decomposition learning method for complex Bayesian networks. *Complex & Intelligent Systems*, 12:164. — `IterDSLALearner`
+* Moral, S., Moral-García, S., Cano, A., et al. (2026). Computing conditional probabilities in Bayesian networks using logistic regression. *Applied Soft Computing*, 198, 115284. — `LogisticRegressionParameterLearner`
+* Kanamori, T., Takagi, S., & Kobayashi, K. (2026). Sparse Additive Model Pruning for Order-Based Causal Structure Learning. *AAAI 2026*. — `SARTREPruner`
+* Huang, Z., & Suzuki, J. (2026). Memory-efficient exact Bayesian network structure learning: a single-pass level-wise dynamic program. *Behaviormetrika*. — `LevelWiseDPLearner`
+* Deng, C., & Aragam, B. (2025). Differentiable Structure Learning and Causal Discovery for General Binary Data. *NeurIPS 2025*. — `BinaryNotearsLearner`
+* Silander, T., & Myllymäki, P. (2012). A simple approach for finding the globally optimal Bayesian network structure. *UAI 2006*. (basis for the level-wise DP)
+* Zheng, X., Aragam, B., Ravikumar, P., & Xing, E. P. (2018). DAGs with NO TEARS: Continuous Optimization for Structure Learning. *NeurIPS 2018*. (basis for BINOTEARS)

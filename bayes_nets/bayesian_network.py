@@ -332,6 +332,40 @@ class BayesianNetwork:
                 sample_weights=sample_weights,
             )
 
+        elif method in ("chow_liu", "tree", "branching",
+                        "rebane_pearl", "polytree",
+                        "lpa", "pada", "lpa_marginal",
+                        "causal_polytree", "sheaf"):
+            from bayes_nets.polytree_learning import (
+                ChowLiuTreeLearner,
+                RebanePearlPolytreeLearner,
+                PolytreeLPALearner,
+                CausalPolytreeLearner,
+            )
+            alpha_ci = alpha if 0 < alpha < 1 else 0.05
+            if method in ("chow_liu", "tree", "branching"):
+                learner = ChowLiuTreeLearner(alpha_ci=alpha_ci, max_parents=max_parents)
+            elif method in ("rebane_pearl", "polytree"):
+                learner = RebanePearlPolytreeLearner(
+                    alpha_ci=alpha_ci, max_parents=max_parents
+                )
+            elif method in ("lpa", "pada", "lpa_marginal"):
+                learner = PolytreeLPALearner(
+                    alpha_ci=alpha_ci,
+                    dep_mode="marginal" if method == "lpa_marginal" else "global",
+                    max_parents=max_parents,
+                )
+            else:
+                learner = CausalPolytreeLearner(
+                    alpha_ci=alpha_ci, max_parents=max_parents
+                )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
         elif method in ("dt", "decision_tree"):
             from bayes_nets.structure_learning import DecisionTreeLearner
             learner = DecisionTreeLearner(

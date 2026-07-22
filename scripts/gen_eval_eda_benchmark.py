@@ -58,8 +58,54 @@ import numpy as np
 from scipy.stats import spearmanr
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _ROOT)
-from bayes_nets import BayesianNetwork  # noqa: E402
+
+
+def _add_bayes_nets_to_path():
+    """Make the local ``bayes_nets`` source package importable.
+
+    This script does NOT require ``bayes_nets`` to be pip-installed (no PyPI
+    publish needed): it imports the package straight from the source folder
+    shipped with the repository.  We search a few likely locations for the
+    folder that contains ``bayes_nets/__init__.py`` and put it first on
+    ``sys.path`` so the local source shadows any installed distribution.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        _ROOT,                       # repo root (…/scripts/..) — normal layout
+        here,                        # a bayes_nets/ folder next to this script
+        os.path.dirname(_ROOT),      # one level above the repo root
+        os.getcwd(),                 # current working directory
+    ]
+    seen = set()
+    ordered = [c for c in candidates if not (c in seen or seen.add(c))]
+    for cand in ordered:
+        if os.path.isfile(os.path.join(cand, "bayes_nets", "__init__.py")):
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
+            return cand, ordered
+    return None, ordered
+
+
+_PKG_ROOT, _SEARCHED = _add_bayes_nets_to_path()
+try:
+    from bayes_nets import BayesianNetwork  # noqa: E402
+except ImportError as exc:
+    _looked = "\n  ".join(
+        os.path.join(c, "bayes_nets", "__init__.py") for c in _SEARCHED
+    )
+    raise SystemExit(
+        "ERROR: could not import the 'bayes_nets' package.\n\n"
+        "This script uses the bayes_nets/ SOURCE FOLDER directly — no pip\n"
+        "install and no PyPI/GitHub publish is required — but that folder was\n"
+        "not found on this machine.  Copy the repository's bayes_nets/ package\n"
+        "folder to the repo root so that one of these files exists:\n\n"
+        "  " + _looked + "\n\n"
+        "For example, from your local machine (no GitHub needed):\n"
+        "  rsync -av bayes_nets/ <cluster>:" + os.path.join(_ROOT, "bayes_nets") + "/\n"
+        "  # or:  tar czf bn.tgz bayes_nets && scp bn.tgz <cluster>:"
+        + _ROOT + " && (cd " + _ROOT + " && tar xzf bn.tgz)\n\n"
+        f"Original import error: {exc}"
+    )
 
 DATA_DIR = os.path.join(_ROOT, "data", "eda_datasets")
 DEFAULT_OUT = os.path.join(_ROOT, "results", "eda_eval_cluster")
@@ -240,10 +286,17 @@ def write_result(path, vector, problem, train_set, algorithm, seed, temp_str, ex
     )
     header_cols = "# " + " ".join(VALUE_NAMES)
     body = " ".join(f"{v:.8g}" for v in vector)
-    with open(path, "w") as fh:
-        fh.write(header_params + "\n")
-        fh.write(header_cols + "\n")
-        fh.write(body + "\n")
+    content = header_params + "\n" + header_cols + "\n" + body + "\n"
+    # Write to a temporary file in the same directory, then atomically replace
+    # the target.  os.replace overwrites any existing file and is robust even
+    # when a job wrapper has redirected stdout onto the same path: the final
+    # result file always contains exactly this 11-value vector.
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w") as fh:
+        fh.write(content)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, path)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +315,9 @@ def main():
     temp_str = sys.argv[5]                    # keep the raw string for the filename
     temperature = float(temp_str)
     out_dir = sys.argv[6] if len(sys.argv) > 6 else DEFAULT_OUT
+    # Resolve to an absolute path so the result location never depends on the
+    # current working directory (which the cluster wrapper may set elsewhere).
+    out_dir = os.path.abspath(out_dir)
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(
@@ -275,10 +331,7 @@ def main():
     print(f"Temperature:      {temperature}")
     print(f"Output:           {out_path}")
 
-    # Idempotent: skip if already computed (safe to re-launch).
-    if os.path.isfile(out_path):
-        print("Result already exists — skipping.")
-        return
+    # Always run and overwrite the result file (no skip-if-exists check).
 
     t_start = time.time()
     try:

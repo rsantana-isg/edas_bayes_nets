@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# Job name
+#SBATCH --job-name=eda_eval
+# Output and error files (one per array/job)
+#SBATCH --output=outputs/EDAEVAL_%A_%a.out
+#SBATCH --error=outputs/EDAEVAL_%A_%a.err
+
+# Resource requirements
+#SBATCH --ntasks=1
+#SBATCH --mem-per-cpu=8G
+#SBATCH --partition=CPU
+
+# Parameters (positional, matching scripts/gen_eval_eda_benchmark.py):
+# $1 = problem      (dataset name in data/eda_datasets/, e.g. Braid_36)
+# $2 = train_set    (0, 1 or 2: which split is the training pool)
+# $3 = algorithm    (BN learning method, e.g. k2, fi_k2, dmbbn, ...)
+# $4 = seed         (integer RNG seed)
+# $5 = temperature  (Boltzmann T, e.g. 0.1, 1.0, 10)
+
+# Directory where the runner writes its self-named result file.
+OUT_DIR="results/eda_eval_cluster"
+mkdir -p "$OUT_DIR" outputs
+
+# Output filename encodes all parameters (self-describing, idempotent).
+OUTPUT_FILE="${OUT_DIR}/eval_${1}_tr${2}_${3}_T${5}_s${4}.dat"
+
+# Skip if already done (idempotent, safe to re-launch).
+if [ -f "$OUTPUT_FILE" ]; then
+    echo "Already done: $OUTPUT_FILE"
+    exit 0
+fi
+
+echo "Executing: python3 scripts/gen_eval_eda_benchmark.py $1 $2 $3 $4 $5 $OUT_DIR"
+
+# Execute one benchmark combination.  (Use the cluster's python wrapper if
+# needed, e.g. replace 'python3' with 'bnd -exec python3' as in slurm_pbo.sh.)
+python3 scripts/gen_eval_eda_benchmark.py "$1" "$2" "$3" "$4" "$5" "$OUT_DIR"
+
+# Example usage:
+# sbatch slurm/slurm_eval_eda_benchmark.sh Braid_36 0 fi_k2 7 1.0

@@ -24,6 +24,7 @@ Methods implemented:
   Score-based   : K2, BIC-HC, AIC-HC, HC-Stable, Tabu
   Local-structure: DT (decision-tree MDL), DG (decision-graph Bayesian)
   Constraint-based: GS, RCD, RPCD, PC, Stable-PC
+  Polytree        : ChowLiu, RebanePearl, LPA-PADA, LPA-marg, Sheaf-CP
 """
 
 import sys
@@ -67,6 +68,12 @@ LEARNING_METHODS = [
     dict(name="RPCD",       method="rpcd",        kwargs={}),
     dict(name="PC",         method="pc",          kwargs={}),
     dict(name="Stable-PC",  method="stable_pc",   kwargs={}),
+    # ── Polytree / singly connected ────────────────────────────────────
+    dict(name="ChowLiu",    method="chow_liu",     kwargs={}),
+    dict(name="RebanePearl",method="rebane_pearl", kwargs={}),
+    dict(name="LPA-PADA",   method="lpa",          kwargs={}),
+    dict(name="LPA-marg",   method="lpa_marginal", kwargs={}),
+    dict(name="Sheaf-CP",   method="causal_polytree", kwargs={}),
     # ── Markov-blanket / decomposition-based ───────────────────────────
     dict(name="DMBBN",      method="dmbbn",       kwargs={}),
     dict(name="iter-DSLA",  method="iterdsla",    kwargs={}),

@@ -42,6 +42,12 @@ from bayes_nets.structure_learning import (
     feature_importance_ordering,
     rfe_ordering,
 )
+from bayes_nets.polytree_learning import (
+    ChowLiuTreeLearner,
+    RebanePearlPolytreeLearner,
+    PolytreeLPALearner,
+    CausalPolytreeLearner,
+)
 from bayes_nets.notears import BinaryNotearsLearner
 from bayes_nets.parameter_learning import (
     MLEParameterLearner,
@@ -91,6 +97,10 @@ __all__ = [
     "RFEK2Learner",
     "feature_importance_ordering",
     "rfe_ordering",
+    "ChowLiuTreeLearner",
+    "RebanePearlPolytreeLearner",
+    "PolytreeLPALearner",
+    "CausalPolytreeLearner",
     "BinaryNotearsLearner",
     "MLEParameterLearner",
     "LogisticRegressionParameterLearner",

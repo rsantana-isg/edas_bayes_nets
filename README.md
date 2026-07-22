@@ -134,6 +134,40 @@ Unconstrained greedy hill-climbing with BIC or AIC scoring.  No ordering needed;
 bn.learn_structure(data, method="bic", max_parents=3)
 ```
 
+### Polytree (singly connected) learners
+
+A **polytree** is a DAG whose skeleton has no undirected cycle, so at most one
+path connects any two variables.  Polytrees admit exact linear-time inference
+and need far fewer samples than general BNs, which is why they are the model
+class of the Polytree Approximation Distribution Algorithm (PADA / FDA-SC).
+These learners live in `bayes_nets/polytree_learning.py` and were implemented
+from the papers in `docs/PADA/`:
+
+| Method | Class / `method=` | Paper |
+|--------|-------------------|-------|
+| **Chow-Liu branching** — max-weight spanning forest over mutual information; a provably bounded approximation to the optimal polytree | `ChowLiuTreeLearner` / `"chow_liu"` | Chow & Liu (1968); Dasgupta (1999) |
+| **Rebane-Pearl** — Chow-Liu skeleton + collider orientation from marginal independence | `RebanePearlPolytreeLearner` / `"rebane_pearl"` | Rebane & Pearl (1987) |
+| **LPA** — edges ranked by the global dependency degree `DepG(a,b) = min(Dep(a,b), min_c Dep(a,b|c))`, oriented by comparing dependency before/after instantiating the middle node | `PolytreeLPALearner` / `"lpa"`, `"lpa_marginal"` | Ochoa, Mühlenbein & Soto (2000) |
+| **Sheaf-based causal polytree** — incremental node insertion using only marginal and first-order CI tests, O(n²) | `CausalPolytreeLearner` / `"causal_polytree"` | Huete & de Campos (1993) |
+
+```python
+# LPA, the learner used inside PADA / FDA-SC
+bn.learn_structure(data, method="lpa", alpha=0.05)
+
+# quadratic variant: rank by marginal dependency only
+bn.learn_structure(data, method="lpa_marginal")
+```
+
+All four guarantee a singly connected result. `alpha` sets the significance
+level of the independence tests; the LPA thresholds `e0`/`e1` are derived from
+it and scale as `1/N`, reproducing the population-size dependence the PADA
+paper requires.  `"chow_liu"` restricts every node to a single parent
+(a *branching*); the other three can represent head-to-head patterns.
+
+Note that a pure XOR-style collider is invisible to any of these learners:
+each parent is then *marginally* independent of the child, so no pairwise
+dependency measure can place the edge (Dasgupta 1999, Example 2).
+
 ### Advanced learners from the recent literature
 
 These learners were implemented from the papers surveyed in

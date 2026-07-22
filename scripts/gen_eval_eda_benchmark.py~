@@ -59,7 +59,7 @@ from scipy.stats import spearmanr
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
-#from bayes_nets import BayesianNetwork  # noqa: E402
+from bayes_nets import BayesianNetwork  # noqa: E402
 
 DATA_DIR = os.path.join(_ROOT, "data", "eda_datasets")
 DEFAULT_OUT = os.path.join(_ROOT, "results", "eda_eval_cluster")
