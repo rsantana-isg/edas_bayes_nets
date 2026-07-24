@@ -7,6 +7,7 @@ bayes_nets/circuits.py
 bayes_nets/copula.py
 bayes_nets/factorization.py
 bayes_nets/inference.py
+bayes_nets/local_structure.py
 bayes_nets/notears.py
 bayes_nets/parameter_learning.py
 bayes_nets/polytree_learning.py

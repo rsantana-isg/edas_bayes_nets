@@ -53,7 +53,12 @@ from bayes_nets.parameter_learning import (
     MLEParameterLearner,
     LogisticRegressionParameterLearner,
 )
-from bayes_nets.sampling import ProbabilisticLogicSampler
+from bayes_nets.local_structure import (
+    LocalStructureCPD,
+    LocalStructureParameterLearner,
+    learn_local_cpd,
+)
+from bayes_nets.sampling import ProbabilisticLogicSampler, LocalStructureSampler
 from bayes_nets.copula import GaussianCopulaSampler
 from bayes_nets.factorization import (
     CliqueFactorization,
@@ -105,6 +110,10 @@ __all__ = [
     "MLEParameterLearner",
     "LogisticRegressionParameterLearner",
     "ProbabilisticLogicSampler",
+    "LocalStructureSampler",
+    "LocalStructureCPD",
+    "LocalStructureParameterLearner",
+    "learn_local_cpd",
     "GaussianCopulaSampler",
     "CliqueFactorization",
     "moralize",

@@ -5,6 +5,13 @@ ProbabilisticLogicSampler
     Generates samples from a BN using probabilistic logic sampling
     (a.k.a. forward / ancestral sampling).  Variables are sampled in
     topological order, conditioning on already-sampled parent values.
+
+LocalStructureSampler
+    Ancestral sampler that draws each variable directly from its
+    decision-tree / decision-graph CPD by *routing* the parent configuration
+    to the corresponding leaf, without materialising the dense CPD table.  This
+    is what lets the compact context-specific structure be exploited at
+    sampling time, not only during structure selection.
 """
 
 from __future__ import annotations
@@ -126,3 +133,47 @@ class ProbabilisticLogicSampler:
         if total == 0.0:
             return np.ones_like(p) / len(p)
         return p / total
+
+
+class LocalStructureSampler:
+    """Ancestral sampler for BNs whose CPDs use decision-tree / -graph structure.
+
+    Each ``cpds[var]`` must carry a ``"local"`` entry holding a
+    :class:`bayes_nets.local_structure.LocalStructureCPD`.  Variables are
+    sampled in topological order; for each one the parent columns already
+    sampled are routed through its decision tree/graph to obtain, per row, the
+    leaf distribution to draw from.  The dense conditional table is never built,
+    so sampling stays cheap even for high-in-degree nodes.
+    """
+
+    def sample(
+        self,
+        n_samples: int,
+        n_vars: int,
+        cardinality: np.ndarray,
+        adjacency: np.ndarray,
+        cpds: Dict[int, Dict],
+        rng: Optional[np.random.Generator] = None,
+    ) -> np.ndarray:
+        if rng is None:
+            rng = np.random.default_rng()
+
+        order = ProbabilisticLogicSampler._topological_sort(adjacency, n_vars)
+        population = np.zeros((n_samples, n_vars), dtype=int)
+
+        for var in order:
+            info = cpds[var]
+            local = info.get("local")
+            if local is None:
+                raise ValueError(
+                    f"Variable {var} has no local-structure CPD; use "
+                    "ProbabilisticLogicSampler for dense tabular CPDs."
+                )
+            parents: List[int] = info["parents"]
+            if not parents:
+                population[:, var] = local.sample_rows(n_samples, rng)
+            else:
+                parent_values = population[:, parents]
+                population[:, var] = local.sample_rows(parent_values, rng)
+
+        return population

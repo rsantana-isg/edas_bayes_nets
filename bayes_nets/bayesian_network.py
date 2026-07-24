@@ -67,6 +67,9 @@ class BayesianNetwork:
 
         self.adjacency: np.ndarray = np.zeros((n_vars, n_vars), dtype=int)
         self.cpds: Dict[int, Dict] = {}
+        # ``None`` for dense tabular CPDs, or "dt"/"dg" when the CPDs use
+        # decision-tree / decision-graph local structure.
+        self.local_structure: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Graph manipulation
@@ -132,6 +135,8 @@ class BayesianNetwork:
         permutation: Optional[np.ndarray] = None,
         interaction_matrix: Optional[np.ndarray] = None,
         sample_weights: Optional[np.ndarray] = None,
+        local_structure: Optional[str] = None,
+        **learn_kwargs,
     ) -> "BayesianNetwork":
         """Learn structure **and** parameters from *data*.
 
@@ -144,7 +149,8 @@ class BayesianNetwork:
             Scoring / search algorithm.  Choices: ``"bic"``, ``"aic"``,
             ``"k2"``, ``"stable_hc"``, ``"tabu"``, ``"gs"``, ``"rcd"``,
             ``"rpcd"``, ``"pc"``, ``"stable_pc"``, ``"dt"``/
-            ``"decision_tree"``, ``"dg"``/``"decision_graph"``.
+            ``"decision_tree"``, ``"dg"``/``"decision_graph"``, ``"sartre"``,
+            ``"dmbbn"``, ... (see :meth:`learn_structure`).
         max_parents : int or None
             Maximum parents per variable.  ``None`` → rule of thumb
             ``max(1, floor(10·log2/log(max_cardinality)))``
@@ -166,6 +172,16 @@ class BayesianNetwork:
             Probability vector (must sum to 1).  Weighted counts replace
             raw counts during structure and parameter learning.
             ``None`` → uniform 1/N.
+        local_structure : {None, "dt", "dg"}, optional
+            When ``"dt"`` or ``"dg"``, the CPDs are represented with
+            **decision-tree** or **decision-graph** local structure instead of
+            dense tables.  Any base skeleton learner (``method``) can thus be
+            composed with a compact, context-specific CPD representation; the
+            learned decision graphs are also exploited when sampling.  ``None``
+            (default) keeps the classical dense tabular CPDs.
+        **learn_kwargs
+            Extra keyword arguments forwarded to :meth:`learn_structure`
+            (e.g. ``treewidth_bound``, ``seed``, ``fs_importance``).
 
         Returns
         -------
@@ -185,8 +201,15 @@ class BayesianNetwork:
             permutation=permutation,
             interaction_matrix=interaction_matrix,
             sample_weights=sample_weights,
+            **learn_kwargs,
         )
-        self.learn_parameters(data, alpha=alpha, sample_weights=sample_weights)
+        if local_structure is not None:
+            self.learn_local_structure(
+                data, structure=local_structure, alpha=alpha,
+                sample_weights=sample_weights,
+            )
+        else:
+            self.learn_parameters(data, alpha=alpha, sample_weights=sample_weights)
         return self
 
     def learn_structure(
@@ -559,6 +582,66 @@ class BayesianNetwork:
         )
         return self
 
+    def learn_local_structure(
+        self,
+        data: np.ndarray,
+        structure: str = "dt",
+        *,
+        alpha: float = 1.0,
+        max_depth: Optional[int] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> "BayesianNetwork":
+        """Fit decision-tree / decision-graph CPDs for the current structure.
+
+        Given the DAG already stored in :attr:`adjacency` (learned by any base
+        skeleton learner), this estimates a compact **decision-tree**
+        (``structure="dt"``) or **decision-graph** (``structure="dg"``)
+        conditional probability distribution for every variable, instead of a
+        dense table.  Each ``cpds[var]`` gains a ``"local"`` entry holding a
+        :class:`bayes_nets.local_structure.LocalStructureCPD`; the dense
+        ``"cpd"`` table is still filled when it is small enough, so existing
+        table-based code keeps working, while :meth:`sample` exploits the
+        compact local structure directly.
+
+        This is the composable primitive behind
+        ``fit(method=..., local_structure="dg")``: it decouples the choice of
+        skeleton learner from the CPD representation.
+
+        Parameters
+        ----------
+        data : np.ndarray, shape (n_samples, n_vars)
+        structure : {"dt", "dg"}
+            Decision tree or decision graph.
+        alpha : float
+            Laplace / Dirichlet smoothing.
+        max_depth : int or None
+            Maximum decision-tree depth (``None`` → grow until no split helps).
+        sample_weights : array of float, shape (n_samples,), optional
+            Probability vector over rows (must sum to 1).
+
+        References
+        ----------
+        Friedman & Goldszmidt (1996); Chickering, Heckerman & Meek (1997).
+        """
+        from bayes_nets.local_structure import LocalStructureParameterLearner
+
+        data = np.asarray(data, dtype=int)
+        learner = LocalStructureParameterLearner(
+            method=structure, alpha=alpha, max_depth=max_depth
+        )
+        self.cpds = learner.learn(
+            data, self.n_vars, self.cardinality, self.adjacency,
+            sample_weights=sample_weights,
+        )
+        self.local_structure = structure
+        return self
+
+    def has_local_structure(self) -> bool:
+        """True if the CPDs use decision-tree / decision-graph local structure."""
+        return bool(self.cpds) and any(
+            "local" in self.cpds[v] for v in self.cpds
+        )
+
     def learn_variable_clustering(
         self,
         data: np.ndarray,
@@ -634,6 +717,22 @@ class BayesianNetwork:
             raise RuntimeError(
                 "CPDs have not been estimated yet. Call learn_parameters() or fit() first."
             )
+        # When the CPDs carry decision-tree / decision-graph local structure,
+        # sample directly from it (routing parent configs to leaves), which
+        # exploits the compact representation and also works when a dense table
+        # was too large to materialise.
+        if self.has_local_structure():
+            from bayes_nets.sampling import LocalStructureSampler
+
+            return LocalStructureSampler().sample(
+                n_samples=n_samples,
+                n_vars=self.n_vars,
+                cardinality=self.cardinality,
+                adjacency=self.adjacency,
+                cpds=self.cpds,
+                rng=rng,
+            )
+
         from bayes_nets.sampling import ProbabilisticLogicSampler
 
         sampler = ProbabilisticLogicSampler()
@@ -705,9 +804,19 @@ class BayesianNetwork:
     # ------------------------------------------------------------------
 
     def n_parameters(self) -> int:
-        """Total number of free parameters in the CPDs."""
+        """Total number of free parameters in the CPDs.
+
+        When the CPDs use decision-tree / decision-graph local structure the
+        count reflects the *compact* representation (distinct leaves per
+        variable), which is what makes local structure more parameter-efficient
+        than dense tables.
+        """
         total = 0
         for var in range(self.n_vars):
+            local = self.cpds.get(var, {}).get("local") if self.cpds else None
+            if local is not None:
+                total += local.n_parameters
+                continue
             parents = self.get_parents(var)
             k = int(self.cardinality[var])
             n_parent_configs = int(

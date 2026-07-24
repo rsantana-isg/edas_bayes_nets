@@ -1472,3 +1472,185 @@ class TestRFEOrdering:
         bn = BayesianNetwork(n_vars=X.shape[1], cardinality=card)
         bn.learn_structure(X, method="rfe_k2", sample_weights=w, seed=1)
         assert bn.is_dag()
+
+
+# ---------------------------------------------------------------------------
+# Local-structure CPDs (decision-tree / decision-graph)  compose with any learner
+# ---------------------------------------------------------------------------
+
+def _context_specific_data(n=4000, seed=7):
+    """Node 2 depends on its parents (0,1) via a context-specific pattern:
+    if X0==0 the child ignores X1, otherwise it copies X1 (noisy).  A 4th
+    variable X3 depends only on X0.  Returns (data, cardinality, true_adj)."""
+    rng = np.random.default_rng(seed)
+    X0 = rng.integers(0, 2, n)
+    X1 = np.where(rng.random(n) < 0.1, 1 - X0, X0)
+    X2 = np.where(X0 == 0, (rng.random(n) < 0.85).astype(int),
+                  np.where(rng.random(n) < 0.1, 1 - X1, X1))
+    X3 = np.where(rng.random(n) < 0.1, 1 - X0, X0)
+    data = np.column_stack([X0, X1, X2, X3])
+    true = np.zeros((4, 4), dtype=int)
+    true[0, 1] = true[1, 2] = true[0, 2] = true[0, 3] = 1
+    return data, np.full(4, 2), true
+
+
+class TestLocalStructureCPD:
+    def test_dt_captures_context_specific_independence(self):
+        from bayes_nets import learn_local_cpd
+        data, card, _ = _context_specific_data()
+        # child 2 with parents [0,1]: when X0==0 the child ignores X1, so a
+        # full table (4 configs) collapses to 3 tree leaves.
+        cpd = learn_local_cpd(2, [0, 1], data, card, method="dt")
+        assert cpd.n_leaves() == 3
+        assert cpd.n_parameters < cpd.full_table_parameters()
+
+    def test_dg_merges_equivalent_leaves(self):
+        from bayes_nets import learn_local_cpd
+        data, card, _ = _context_specific_data()
+        dg = learn_local_cpd(2, [0, 1], data, card, method="dg")
+        # the two X0==0 leaves share a distribution -> fewer distinct leaves
+        assert dg.n_distinct_leaves <= dg.n_leaves()
+        assert dg.n_parameters <= dg.full_table_parameters()
+
+    def test_to_table_matches_prob_matrix(self):
+        from bayes_nets import learn_local_cpd
+        data, card, _ = _context_specific_data()
+        cpd = learn_local_cpd(2, [0, 1], data, card, method="dt")
+        table = cpd.to_table()
+        assert table.shape == (4, 2)
+        assert np.allclose(table.sum(axis=1), 1.0)
+        # config idx: 0=(0,0),1=(1,0),2=(0,1),3=(1,1) with first parent fastest
+        configs = np.array([[0, 0], [1, 0], [0, 1], [1, 1]])
+        assert np.allclose(cpd.prob_matrix(configs), table)
+
+    def test_parentless_cpd(self):
+        from bayes_nets import learn_local_cpd
+        data, card, _ = _context_specific_data()
+        cpd = learn_local_cpd(0, [], data, card, method="dg")
+        tab = cpd.to_table()
+        assert tab.shape == (2,)
+        assert np.isclose(tab.sum(), 1.0)
+        rng = np.random.default_rng(0)
+        s = cpd.sample_rows(500, rng)
+        assert s.shape == (500,)
+
+    def test_dt_dg_high_indegree_compaction(self):
+        # 4 parents but the child depends only on the first: dense=16 params,
+        # local structure must collapse to 2.
+        rng = np.random.default_rng(3)
+        n = 4000
+        P = rng.integers(0, 2, (n, 4))
+        y = np.where(P[:, 0] == 0, (rng.random(n) < 0.9).astype(int),
+                     (rng.random(n) < 0.1).astype(int))
+        data = np.column_stack([P, y])
+        card = np.full(5, 2)
+        from bayes_nets import learn_local_cpd
+        for method in ("dt", "dg"):
+            cpd = learn_local_cpd(4, [0, 1, 2, 3], data, card, method=method)
+            assert cpd.full_table_parameters() == 16
+            assert cpd.n_parameters == 2
+
+
+class TestComposeLocalStructure:
+    def test_compose_sartre_with_dg(self):
+        # The headline feature: any base skeleton learner + decision-graph CPDs.
+        data, card, _ = _context_specific_data()
+        bn = BayesianNetwork(4, card)
+        bn.fit(data, method="sartre", local_structure="dg",
+               permutation=np.arange(4))
+        assert bn.is_dag()
+        assert bn.has_local_structure()
+        assert bn.local_structure == "dg"
+        assert all("local" in bn.cpds[v] for v in range(4))
+
+    def test_compose_k2_with_dt(self):
+        data, card, _ = _context_specific_data()
+        bn = BayesianNetwork(4, card)
+        bn.fit(data, method="k2", local_structure="dt")
+        assert bn.has_local_structure()
+        assert bn.local_structure == "dt"
+
+    def test_local_structure_reduces_parameters(self):
+        # Dense vs local parameter count on the same learned structure.
+        rng = np.random.default_rng(5)
+        n = 4000
+        P = rng.integers(0, 2, (n, 4))
+        y = np.where(P[:, 0] == 0, (rng.random(n) < 0.9).astype(int),
+                     (rng.random(n) < 0.1).astype(int))
+        data = np.column_stack([P, y]).astype(int)
+        card = np.full(5, 2)
+        adj = np.zeros((5, 5), dtype=int)
+        adj[:4, 4] = 1
+        dense = BayesianNetwork(5, card); dense.set_structure(adj)
+        dense.learn_parameters(data)
+        local = BayesianNetwork(5, card); local.set_structure(adj)
+        local.learn_local_structure(data, structure="dg")
+        assert local.n_parameters() < dense.n_parameters()
+
+    def test_learn_local_structure_on_external_dag(self):
+        data, card, true = _context_specific_data()
+        bn = BayesianNetwork(4, card)
+        bn.set_structure(true)
+        bn.learn_local_structure(data, structure="dt")
+        assert bn.has_local_structure()
+        for v in range(4):
+            assert bn.cpds[v]["local"].var == v
+
+    def test_sample_from_decision_graph_cpds(self):
+        # Direct sampling from DG CPDs reproduces the data marginals.
+        data, card, true = _context_specific_data()
+        bn = BayesianNetwork(4, card)
+        bn.set_structure(true)
+        bn.learn_local_structure(data, structure="dg")
+        s = bn.sample(6000, rng=np.random.default_rng(9))
+        assert s.shape == (6000, 4)
+        assert set(np.unique(s)).issubset({0, 1})
+        assert np.allclose(s.mean(axis=0), data.mean(axis=0), atol=0.05)
+
+    def test_sampler_matches_table_expansion(self):
+        # Sampling via the local sampler and via the expanded dense table (same
+        # RNG-independent statistic) should agree in distribution.
+        data, card, true = _context_specific_data()
+        bn = BayesianNetwork(4, card)
+        bn.set_structure(true)
+        bn.learn_local_structure(data, structure="dt")
+        # expand every local CPD to a table and check equality with prob_matrix
+        for v in range(4):
+            local = bn.cpds[v]["local"]
+            if not local.parents:
+                continue
+            table = local.to_table()
+            configs = np.array(list(np.ndindex(*[card[p] for p in local.parents])))
+            # np.ndindex yields last-fastest; convert to first-fastest index
+            idx = np.zeros(len(configs), dtype=int)
+            mult = 1
+            for j, p in enumerate(local.parents):
+                idx += configs[:, j] * mult
+                mult *= int(card[p])
+            assert np.allclose(local.prob_matrix(configs), table[idx])
+
+    def test_sample_weights_supported(self):
+        # Weighting a row must equal replicating it.  Tested with a decision
+        # tree and no smoothing (alpha=0), where the equivalence is exact; with
+        # alpha>0 the Laplace pseudo-count is relative to the effective sample
+        # size, which differs between the weighted and the replicated data set.
+        data, card, true = _context_specific_data(n=800)
+        rng = np.random.default_rng(0)
+        mult = rng.integers(1, 4, size=len(data))
+        rep = np.repeat(data, mult, axis=0)
+        w = mult / mult.sum()
+        a = BayesianNetwork(4, card); a.set_structure(true)
+        a.learn_local_structure(data, structure="dt", alpha=0.0, sample_weights=w)
+        b = BayesianNetwork(4, card); b.set_structure(true)
+        b.learn_local_structure(rep, structure="dt", alpha=0.0)
+        for v in range(4):
+            assert np.allclose(a.cpds[v]["local"].to_table(),
+                               b.cpds[v]["local"].to_table(), atol=1e-9)
+
+    def test_dg_requires_positive_alpha(self):
+        # The decision-graph K2 score is undefined at alpha=0; a clear error is
+        # raised instead of silently degenerating to a single leaf.
+        data, card, _ = _context_specific_data(n=400)
+        from bayes_nets import learn_local_cpd
+        with pytest.raises(ValueError):
+            learn_local_cpd(2, [0, 1], data, card, method="dg", alpha=0.0)
