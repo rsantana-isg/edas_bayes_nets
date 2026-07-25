@@ -328,6 +328,161 @@ class K2ScoringMethod(ScoringMethod):
 
 
 # ---------------------------------------------------------------------------
+# Penalized K2  (Larrañaga et al. 2000; Etxeberria et al. 1997)
+# ---------------------------------------------------------------------------
+
+
+class K2PenScoringMethod(ScoringMethod):
+    """Penalized-K2 score of Larrañaga et al. (2000), ``EBNA_K2+pen``.
+
+    ``local_score = K2_local_score  −  f(N) · dim_local``
+
+    where ``dim_local = n_parent_configs · (k − 1)`` is the number of free
+    parameters of the local CPD and ``f(N)`` is the complexity-penalty weight:
+
+    * ``penalty="bic"`` → ``f(N) = 0.5 · log(N)``  (Schwarz / BIC weight);
+    * ``penalty="aic"`` → ``f(N) = 1``             (Akaike weight);
+    * ``penalty=<float>`` → ``f(N) = that constant``.
+
+    The marginal-likelihood term is the plain K2 (Cooper & Herskovits 1992)
+    Dirichlet-multinomial score; subtracting the explicit dimension penalty
+    turns the (score-equivalent-unbounded) K2 metric into the penalized metric
+    that the original EBNA uses to depart from LFDA.  With ``f(N) = 0`` the
+    score reduces to plain K2.
+
+    Parameters
+    ----------
+    alpha : float
+        Dirichlet prior equivalent sample size (K2 prior).
+    sample_weights : array of float, shape (n_samples,), optional
+        Probability distribution over rows (must sum to 1).
+    penalty : {"bic", "aic"} or float
+        Penalty weight ``f(N)`` (see above).
+
+    References
+    ----------
+    Larrañaga, Etxeberria, Lozano & Peña (2000). "Combinatorial Optimization
+    by Learning and Simulation of Bayesian Networks." UAI-2000.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        sample_weights: Optional[np.ndarray] = None,
+        penalty="bic",
+    ) -> None:
+        self.alpha = alpha
+        self.sample_weights = sample_weights
+        self.penalty = penalty
+        self._k2 = K2ScoringMethod(alpha=alpha, sample_weights=sample_weights)
+
+    def with_weights(self, sample_weights: Optional[np.ndarray]) -> "K2PenScoringMethod":
+        return K2PenScoringMethod(
+            alpha=self.alpha, sample_weights=sample_weights, penalty=self.penalty
+        )
+
+    def f_penalty(self, n_samples: int) -> float:
+        """Return the penalty weight ``f(N)`` for a dataset of ``n_samples`` rows."""
+        pen = self.penalty
+        if isinstance(pen, str):
+            name = pen.lower()
+            if name == "bic":
+                return 0.5 * float(np.log(n_samples))
+            if name == "aic":
+                return 1.0
+            raise ValueError(
+                f"Unknown penalty '{pen}'. Use 'bic', 'aic', or a float constant."
+            )
+        return float(pen)
+
+    def local_score(
+        self,
+        var: int,
+        parents: List[int],
+        data: np.ndarray,
+        cardinality: np.ndarray,
+    ) -> float:
+        base = self._k2.local_score(var, parents, data, cardinality)
+        dim_local = _n_parameters(var, parents, cardinality)
+        return base - self.f_penalty(data.shape[0]) * dim_local
+
+
+def etxeberria_max_parents(
+    cardinality: np.ndarray,
+    n_samples: int,
+    f_N: float,
+) -> np.ndarray:
+    """Per-variable automatic parent-count bound (Etxeberria et al. 1997, Th. 1).
+
+    For the penalized metric ``log P(D|S) − f(N)·Σ_i (r_i−1) q_i`` the maximum
+    number of parents of each variable is bounded automatically.  For variable
+    ``X_i`` with ``r_i`` states and a database of ``N`` cases, write
+    ``N = r_i·m + l`` with ``0 ≤ l < r_i``.  Equation (9) of Larrañaga et al.
+    (2000) gives the threshold
+
+    ``T_i = (1 / ((r_i−1) f(N))) · [ ln N! + ln (r_i+l−1)! − ln (N+r_i−1)!``
+    ``       + m·( ln (2r_i−1)! − ln (r_i−1)! ) ]``
+
+    and ``X_i`` will not have more than ``pa`` parents, where ``pa`` is the
+    smallest count such that the product of the ``pa`` smallest *other* variable
+    cardinalities exceeds ``T_i``.
+
+    Worked example (paper §5): ``n=20``, cardinalities seventeen 3's and three
+    4's, ``N=422``, AIC penalty ``f(N)=1`` ⇒ ``X_8`` (a 4-state variable) has
+    bound ``5``.
+
+    Parameters
+    ----------
+    cardinality : array-like of int, shape (n_vars,)
+    n_samples : int
+        Number of cases ``N`` in the database.
+    f_N : float
+        The penalty weight ``f(N)`` (e.g. ``1`` for AIC, ``0.5·log N`` for BIC).
+
+    Returns
+    -------
+    np.ndarray of int, shape (n_vars,)
+        Per-variable maximum parent count.
+
+    References
+    ----------
+    Etxeberria, Larrañaga & Picaza (1997a). "Reducing Bayesian Networks
+    Complexity while Learning from Data." Proc. Causal Models and Statistical
+    Learning, 151-168 (Theorem 1).
+    Larrañaga, Etxeberria, Lozano & Peña (2000). "Combinatorial Optimization
+    by Learning and Simulation of Bayesian Networks." UAI-2000, eq. (9)
+    (restates the theorem and gives the worked X_8 example).
+    """
+    cardinality = np.asarray(cardinality, dtype=int)
+    n = cardinality.shape[0]
+    N = int(n_samples)
+    bounds = np.empty(n, dtype=int)
+    for i in range(n):
+        ri = int(cardinality[i])
+        if ri < 2 or f_N <= 0 or N <= 0:
+            bounds[i] = n - 1
+            continue
+        m = N // ri
+        l = N % ri
+        threshold = (
+            gammaln(N + 1)
+            + gammaln(ri + l)
+            - gammaln(N + ri)
+            + m * (gammaln(2 * ri) - gammaln(ri))
+        ) / ((ri - 1) * f_N)
+        others = np.sort(np.delete(cardinality, i))
+        prod = 1.0
+        bound = n - 1
+        for pa in range(1, n):
+            prod *= float(others[pa - 1])
+            if prod > threshold:
+                bound = pa
+                break
+        bounds[i] = bound
+    return bounds
+
+
+# ---------------------------------------------------------------------------
 # Decision-tree MDL scorer  (Friedman & Goldszmidt 1996)
 # ---------------------------------------------------------------------------
 
@@ -363,16 +518,19 @@ class DecisionTreeMDLScorer(ScoringMethod):
         alpha: float = 1.0,
         sample_weights: Optional[np.ndarray] = None,
         max_tree_depth: Optional[int] = None,
+        max_leaves: Optional[int] = None,
     ) -> None:
         self.alpha = alpha
         self.sample_weights = sample_weights
         self.max_tree_depth = max_tree_depth
+        self.max_leaves = max_leaves
 
     def with_weights(self, sample_weights: Optional[np.ndarray]) -> "DecisionTreeMDLScorer":
         return DecisionTreeMDLScorer(
             alpha=self.alpha,
             sample_weights=sample_weights,
             max_tree_depth=self.max_tree_depth,
+            max_leaves=self.max_leaves,
         )
 
     def local_score(
@@ -389,7 +547,8 @@ class DecisionTreeMDLScorer(ScoringMethod):
         k = int(cardinality[var])
         alpha_k = self.alpha / k
         idx = np.arange(n)
-        return self._tree_score(var, list(parents), idx, data, cardinality, w, n, k, alpha_k, 0)
+        budget = {"count": 1}  # running leaf count for the max_leaves cap
+        return self._tree_score(var, list(parents), idx, data, cardinality, w, n, k, alpha_k, 0, budget)
 
     # ------------------------------------------------------------------
     # Internal: greedy top-down tree building
@@ -423,6 +582,7 @@ class DecisionTreeMDLScorer(ScoringMethod):
         k: int,
         alpha_k: float,
         depth: int,
+        budget: Optional[dict] = None,
     ) -> float:
         """Score for the subtree rooted at this node (greedy CART-BIC)."""
         leaf_penalty = (k - 1) * np.log(n_total) / 2
@@ -443,6 +603,10 @@ class DecisionTreeMDLScorer(ScoringMethod):
 
         for p in parents:
             cp = int(cardinality[p])
+            # Respect the leaf budget: a split on p turns this leaf into cp leaves.
+            if (self.max_leaves is not None and budget is not None
+                    and budget["count"] + (cp - 1) > self.max_leaves):
+                continue
             pv = data[idx, p]
             p_vals_cache[p] = pv
             children_ll = 0.0
@@ -463,12 +627,14 @@ class DecisionTreeMDLScorer(ScoringMethod):
         # Accept split on best_p; recurse on each child
         remaining = [q for q in parents if q != best_p]
         cp = int(cardinality[best_p])
+        if budget is not None:
+            budget["count"] += cp - 1
         pv = p_vals_cache[best_p]
         total = 0.0
         for val in range(cp):
             child_idx = idx[pv == val]
             total += self._tree_score(
-                var, remaining, child_idx, data, cardinality, weights, n_total, k, alpha_k, depth + 1
+                var, remaining, child_idx, data, cardinality, weights, n_total, k, alpha_k, depth + 1, budget
             )
         return total
 
@@ -505,16 +671,25 @@ class DecisionGraphBayesianScorer(ScoringMethod):
         alpha: float = 1.0,
         sample_weights: Optional[np.ndarray] = None,
         max_tree_depth: Optional[int] = None,
+        max_leaves: Optional[int] = None,
+        split_score: str = "k2",
     ) -> None:
         self.alpha = alpha
         self.sample_weights = sample_weights
         self.max_tree_depth = max_tree_depth
+        self.max_leaves = max_leaves
+        split_score = (split_score or "k2").lower()
+        if split_score not in ("k2", "mdl", "bic"):
+            raise ValueError("split_score must be 'k2', 'mdl', or 'bic'")
+        self.split_score = split_score
 
     def with_weights(self, sample_weights: Optional[np.ndarray]) -> "DecisionGraphBayesianScorer":
         return DecisionGraphBayesianScorer(
             alpha=self.alpha,
             sample_weights=sample_weights,
             max_tree_depth=self.max_tree_depth,
+            max_leaves=self.max_leaves,
+            split_score=self.split_score,
         )
 
     def local_score(
@@ -531,7 +706,8 @@ class DecisionGraphBayesianScorer(ScoringMethod):
         k = int(cardinality[var])
         alpha_k = self.alpha / k
         idx = np.arange(n)
-        leaves = self._build_leaves(var, list(parents), idx, data, cardinality, w, n, k, alpha_k, 0)
+        budget = {"count": 1}  # running leaf count for the max_leaves cap
+        leaves = self._build_leaves(var, list(parents), idx, data, cardinality, w, n, k, alpha_k, 0, budget)
         return sum(self._k2_leaf(var, leaf_idx, data, k, alpha_k, w) for leaf_idx in leaves)
 
     # ------------------------------------------------------------------
@@ -556,6 +732,23 @@ class DecisionGraphBayesianScorer(ScoringMethod):
         score += float(np.sum(gammaln(counts + alpha_k) - gammaln(alpha_k)))
         return score
 
+    def _mdl_leaf(
+        self,
+        var: int,
+        idx: np.ndarray,
+        data: np.ndarray,
+        k: int,
+        alpha_k: float,
+        weights: np.ndarray,
+    ) -> float:
+        """MDL/BIC (smoothed multinomial) log-likelihood at one leaf."""
+        if len(idx) == 0:
+            return 0.0
+        counts = np.bincount(data[idx, var], weights=weights[idx], minlength=k).astype(float) + alpha_k
+        total = counts.sum()
+        nz = counts > 0
+        return float(np.sum(counts[nz] * np.log(counts[nz] / total)))
+
     def _build_leaves(
         self,
         var: int,
@@ -568,27 +761,47 @@ class DecisionGraphBayesianScorer(ScoringMethod):
         k: int,
         alpha_k: float,
         depth: int,
+        budget: Optional[dict] = None,
     ) -> List[np.ndarray]:
-        """Grow a tree greedily using K2 gain; return list of leaf index arrays."""
+        """Grow a tree greedily using the split-score gain; return leaf index arrays.
+
+        ``split_score='k2'`` grows with the K2 (Bayesian) gain; ``'mdl'``/``'bic'``
+        grow with the cheaper BIC/MDL gain.  In every case the resulting leaves
+        are passed through the K2 leaf-merge step (the defining DG operation).
+        """
         if len(idx) == 0 or not parents or (
             self.max_tree_depth is not None and depth >= self.max_tree_depth
         ):
             return [idx]
 
-        base = self._k2_leaf(var, idx, data, k, alpha_k, weights)
+        use_k2 = (self.split_score == "k2")
+        if use_k2:
+            base = self._k2_leaf(var, idx, data, k, alpha_k, weights)
+        else:
+            base = self._mdl_leaf(var, idx, data, k, alpha_k, weights)
 
         best_p = -1
         best_gain = 0.0
 
         for p in parents:
             cp = int(cardinality[p])
+            if (self.max_leaves is not None and budget is not None
+                    and budget["count"] + (cp - 1) > self.max_leaves):
+                continue
             pv = data[idx, p]
-            children_score = sum(
-                self._k2_leaf(var, idx[pv == val], data, k, alpha_k, weights)
-                for val in range(cp)
-                if np.any(pv == val)
-            )
-            gain = children_score - base
+            if use_k2:
+                children_score = sum(
+                    self._k2_leaf(var, idx[pv == val], data, k, alpha_k, weights)
+                    for val in range(cp) if np.any(pv == val)
+                )
+                gain = children_score - base
+            else:
+                children_score = sum(
+                    self._mdl_leaf(var, idx[pv == val], data, k, alpha_k, weights)
+                    for val in range(cp) if np.any(pv == val)
+                )
+                extra = (cp - 1) * (k - 1)
+                gain = children_score - base - extra * np.log(max(n_total, 1)) / 2
             if gain > best_gain:
                 best_gain = gain
                 best_p = p
@@ -596,6 +809,8 @@ class DecisionGraphBayesianScorer(ScoringMethod):
         if best_p < 0:
             return [idx]
 
+        if budget is not None:
+            budget["count"] += int(cardinality[best_p]) - 1
         remaining = [q for q in parents if q != best_p]
         cp = int(cardinality[best_p])
         pv = data[idx, best_p]
@@ -603,7 +818,7 @@ class DecisionGraphBayesianScorer(ScoringMethod):
         for val in range(cp):
             child_idx = idx[pv == val]
             all_leaves.extend(
-                self._build_leaves(var, remaining, child_idx, data, cardinality, weights, n_total, k, alpha_k, depth + 1)
+                self._build_leaves(var, remaining, child_idx, data, cardinality, weights, n_total, k, alpha_k, depth + 1, budget)
             )
 
         # Merge step: pool any pair of leaves whose merged K2 score is higher
@@ -637,3 +852,227 @@ class DecisionGraphBayesianScorer(ScoringMethod):
                 if changed:
                     break
         return leaves
+
+
+# ---------------------------------------------------------------------------
+# Fast scorers with cached sufficient statistics  (Su & Zhang 2006)
+# ---------------------------------------------------------------------------
+#
+# The exact DT/DG scorers rescan ``data[idx, p]`` for **every** candidate
+# parent at **every** node and mask once per parent value.  The "fast" variants
+# below replace that inner double loop by a single weighted 2-D histogram over
+# ``(parent_value, var_value)`` per candidate parent — the cached sufficient
+# statistics of Su & Zhang (2006, *A Fast Decision Tree Learning Algorithm*).
+# All child leaf scores are then read off the histogram rows in one vectorised
+# pass.  The numbers are *identical* to the exact scorers (same weighted counts,
+# same per-leaf formula, same greedy choice and tie-breaking); only the
+# bookkeeping is cheaper.  Empty child branches contribute 0, exactly as the
+# exact scorers skip them.
+
+
+def _dt_ll_rows(hist: np.ndarray, alpha_k: float) -> np.ndarray:
+    """MDL/BIC leaf log-likelihood for every row of a ``(cp, k)`` count histogram.
+
+    Rows whose count sum is zero (absent parent value) return 0, matching the
+    exact scorer which skips empty children.
+    """
+    present = hist.sum(axis=1) > 0
+    c = hist + alpha_k
+    totals = c.sum(axis=1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        contrib = c * np.log(c / totals)
+    ll = contrib.sum(axis=1)
+    ll[~present] = 0.0
+    return ll
+
+
+def _k2_ll_rows(hist: np.ndarray, alpha: float, alpha_k: float) -> np.ndarray:
+    """K2 (Dirichlet-multinomial) leaf log-marginal for every histogram row.
+
+    Rows whose count sum is zero return 0 (exact scorer skips empty children).
+    """
+    present = hist.sum(axis=1) > 0
+    n_eff = hist.sum(axis=1)
+    c = hist + alpha_k
+    row = (gammaln(alpha) - gammaln(n_eff + alpha)
+           + np.sum(gammaln(c) - gammaln(alpha_k), axis=1))
+    row[~present] = 0.0
+    return row
+
+
+def _weighted_joint_hist(
+    parent_vals: np.ndarray,
+    var_vals: np.ndarray,
+    weights: np.ndarray,
+    cp: int,
+    k: int,
+) -> np.ndarray:
+    """Weighted ``(cp, k)`` histogram of ``(parent_value, var_value)`` in one pass."""
+    flat = parent_vals * k + var_vals
+    return np.bincount(flat, weights=weights, minlength=cp * k).astype(float).reshape(cp, k)
+
+
+class FastDecisionTreeMDLScorer(DecisionTreeMDLScorer):
+    """Cached-statistics variant of :class:`DecisionTreeMDLScorer`.
+
+    Produces the identical local score (asserted equal in the test suite) but
+    scores candidate splits from a cached weighted joint histogram instead of
+    per-value masking (Su & Zhang 2006).  Constructor and public API match the
+    exact scorer, plus the inherited ``max_leaves`` bound.
+
+    References
+    ----------
+    Su & Zhang (2006). "A Fast Decision Tree Learning Algorithm." AAAI-06.
+    """
+
+    def with_weights(self, sample_weights: Optional[np.ndarray]) -> "FastDecisionTreeMDLScorer":
+        return FastDecisionTreeMDLScorer(
+            alpha=self.alpha,
+            sample_weights=sample_weights,
+            max_tree_depth=self.max_tree_depth,
+            max_leaves=self.max_leaves,
+        )
+
+    def _tree_score(
+        self,
+        var: int,
+        parents: List[int],
+        idx: np.ndarray,
+        data: np.ndarray,
+        cardinality: np.ndarray,
+        weights: np.ndarray,
+        n_total: int,
+        k: int,
+        alpha_k: float,
+        depth: int,
+        budget: Optional[dict] = None,
+    ) -> float:
+        leaf_penalty = (k - 1) * np.log(n_total) / 2
+        if len(idx) == 0:
+            return -leaf_penalty
+
+        leaf_ll = self._leaf_ll(var, idx, data, k, alpha_k, weights)
+        leaf_score = leaf_ll - leaf_penalty
+        if not parents or (self.max_tree_depth is not None and depth >= self.max_tree_depth):
+            return leaf_score
+
+        var_vals = data[idx, var]
+        w_idx = weights[idx]
+        best_p = -1
+        best_gain = 0.0
+        for p in parents:
+            cp = int(cardinality[p])
+            if (self.max_leaves is not None and budget is not None
+                    and budget["count"] + (cp - 1) > self.max_leaves):
+                continue
+            hist = _weighted_joint_hist(data[idx, p], var_vals, w_idx, cp, k)
+            children_ll = float(_dt_ll_rows(hist, alpha_k).sum())
+            extra_params = (cp - 1) * (k - 1)
+            gain = children_ll - leaf_ll - extra_params * np.log(n_total) / 2
+            if gain > best_gain:
+                best_gain = gain
+                best_p = p
+
+        if best_p < 0:
+            return leaf_score
+
+        remaining = [q for q in parents if q != best_p]
+        cp = int(cardinality[best_p])
+        if budget is not None:
+            budget["count"] += cp - 1
+        pv = data[idx, best_p]
+        total = 0.0
+        for val in range(cp):
+            child_idx = idx[pv == val]
+            total += self._tree_score(
+                var, remaining, child_idx, data, cardinality, weights, n_total, k, alpha_k, depth + 1, budget
+            )
+        return total
+
+
+class FastDecisionGraphBayesianScorer(DecisionGraphBayesianScorer):
+    """Cached-statistics variant of :class:`DecisionGraphBayesianScorer`.
+
+    Produces the identical local score (asserted equal in the test suite) but
+    scores candidate splits from cached weighted joint histograms (Su & Zhang
+    2006).  Constructor and public API match the exact scorer, plus the
+    inherited ``max_leaves`` and ``split_score`` options.  The K2 leaf-merge
+    step is unchanged.
+
+    References
+    ----------
+    Su & Zhang (2006). "A Fast Decision Tree Learning Algorithm." AAAI-06.
+    Chickering, Heckerman & Meek (1997). "A Bayesian Approach to Learning
+    Bayesian Networks with Local Structure." UAI-97.
+    """
+
+    def with_weights(self, sample_weights: Optional[np.ndarray]) -> "FastDecisionGraphBayesianScorer":
+        return FastDecisionGraphBayesianScorer(
+            alpha=self.alpha,
+            sample_weights=sample_weights,
+            max_tree_depth=self.max_tree_depth,
+            max_leaves=self.max_leaves,
+            split_score=self.split_score,
+        )
+
+    def _build_leaves(
+        self,
+        var: int,
+        parents: List[int],
+        idx: np.ndarray,
+        data: np.ndarray,
+        cardinality: np.ndarray,
+        weights: np.ndarray,
+        n_total: int,
+        k: int,
+        alpha_k: float,
+        depth: int,
+        budget: Optional[dict] = None,
+    ) -> List[np.ndarray]:
+        if len(idx) == 0 or not parents or (
+            self.max_tree_depth is not None and depth >= self.max_tree_depth
+        ):
+            return [idx]
+
+        use_k2 = (self.split_score == "k2")
+        if use_k2:
+            base = self._k2_leaf(var, idx, data, k, alpha_k, weights)
+        else:
+            base = self._mdl_leaf(var, idx, data, k, alpha_k, weights)
+
+        var_vals = data[idx, var]
+        w_idx = weights[idx]
+        best_p = -1
+        best_gain = 0.0
+        for p in parents:
+            cp = int(cardinality[p])
+            if (self.max_leaves is not None and budget is not None
+                    and budget["count"] + (cp - 1) > self.max_leaves):
+                continue
+            hist = _weighted_joint_hist(data[idx, p], var_vals, w_idx, cp, k)
+            if use_k2:
+                children_score = float(_k2_ll_rows(hist, self.alpha, alpha_k).sum())
+                gain = children_score - base
+            else:
+                children_score = float(_dt_ll_rows(hist, alpha_k).sum())
+                extra = (cp - 1) * (k - 1)
+                gain = children_score - base - extra * np.log(max(n_total, 1)) / 2
+            if gain > best_gain:
+                best_gain = gain
+                best_p = p
+
+        if best_p < 0:
+            return [idx]
+
+        if budget is not None:
+            budget["count"] += int(cardinality[best_p]) - 1
+        remaining = [q for q in parents if q != best_p]
+        cp = int(cardinality[best_p])
+        pv = data[idx, best_p]
+        all_leaves: List[np.ndarray] = []
+        for val in range(cp):
+            child_idx = idx[pv == val]
+            all_leaves.extend(
+                self._build_leaves(var, remaining, child_idx, data, cardinality, weights, n_total, k, alpha_k, depth + 1, budget)
+            )
+        return self._merge_leaves(var, all_leaves, data, k, alpha_k, weights)

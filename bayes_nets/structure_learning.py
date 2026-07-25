@@ -116,6 +116,81 @@ def _would_create_cycle(adjacency: np.ndarray, parent: int, child: int) -> bool:
     return False
 
 
+def _has_cycle(adjacency: np.ndarray) -> bool:
+    """Return True if the directed 0/1 *adjacency* contains any cycle."""
+    n = adjacency.shape[0]
+    color = np.zeros(n, dtype=int)  # 0=unvisited, 1=on-stack, 2=done
+
+    for start in range(n):
+        if color[start] != 0:
+            continue
+        stack = [(start, 0)]
+        color[start] = 1
+        while stack:
+            node, pi = stack[-1]
+            succ = np.where(adjacency[node] != 0)[0]
+            if pi < len(succ):
+                stack[-1] = (node, pi + 1)
+                nxt = int(succ[pi])
+                if color[nxt] == 1:
+                    return True
+                if color[nxt] == 0:
+                    color[nxt] = 1
+                    stack.append((nxt, 0))
+            else:
+                color[node] = 2
+                stack.pop()
+    return False
+
+
+def _prepare_initial_structure(
+    initial_structure: Optional[np.ndarray],
+    n_vars: int,
+    allowed: Dict[int, List[int]],
+    mp: int,
+) -> np.ndarray:
+    """Validate and sanitise a warm-start adjacency matrix.
+
+    The matrix must be a square ``(n_vars, n_vars)`` 0/1 array encoding
+    ``adjacency[u, v] == 1`` ⇒ edge ``u → v`` (library convention).  It is
+    validated to be square, binary and **acyclic** (``ValueError`` otherwise).
+
+    Edges that violate the permutation / interaction constraints
+    (``u not in allowed[v]``) or that would push a child above ``max_parents``
+    are **silently dropped** (documented behaviour): the warm-start is a hint,
+    not a hard constraint, so an incompatible seed still yields a legal search
+    start rather than an error.  Only structural invalidity (non-square,
+    non-binary, cyclic) raises.
+    """
+    adj = np.asarray(initial_structure)
+    if adj.ndim != 2 or adj.shape[0] != adj.shape[1] or adj.shape[0] != n_vars:
+        raise ValueError(
+            f"initial_structure must be a square ({n_vars}, {n_vars}) adjacency "
+            f"matrix; got shape {adj.shape}."
+        )
+    adj = adj.astype(int).copy()
+    if not np.all((adj == 0) | (adj == 1)):
+        raise ValueError("initial_structure must contain only 0/1 entries.")
+    if np.any(np.diag(adj) != 0):
+        raise ValueError("initial_structure must have a zero diagonal (no self-loops).")
+    if _has_cycle(adj):
+        raise ValueError("initial_structure must be acyclic (it contains a cycle).")
+
+    # Drop edges incompatible with the allowed-parent / max_parents constraints.
+    for v in range(n_vars):
+        allowed_v = set(allowed[v])
+        parents = list(np.where(adj[:, v] > 0)[0])
+        for u in parents:
+            if u not in allowed_v:
+                adj[u, v] = 0
+        # Enforce max_parents: keep the first `mp` parents deterministically.
+        parents = list(np.where(adj[:, v] > 0)[0])
+        if len(parents) > mp:
+            for u in parents[mp:]:
+                adj[u, v] = 0
+    return adj
+
+
 # ---------------------------------------------------------------------------
 # Common-parameter helpers
 # ---------------------------------------------------------------------------
@@ -510,6 +585,20 @@ class GreedyHillClimbLearner:
         self.max_parents = max_parents
         self.limit_table_size = limit_table_size
 
+    def _resolve_max_parents(self, n_vars: int, cardinality: np.ndarray) -> np.ndarray:
+        """Return a per-variable parent-count cap as an ``(n_vars,)`` int array."""
+        mp = self.max_parents
+        if mp is None:
+            return np.full(n_vars, _default_max_parents(cardinality), dtype=int)
+        if np.isscalar(mp):
+            return np.full(n_vars, int(mp), dtype=int)
+        arr = np.asarray(mp, dtype=int)
+        if arr.shape[0] != n_vars:
+            raise ValueError(
+                f"per-variable max_parents must have length {n_vars}; got {arr.shape[0]}."
+            )
+        return arr
+
     def learn(
         self,
         data: np.ndarray,
@@ -520,9 +609,15 @@ class GreedyHillClimbLearner:
         interaction_matrix: Optional[np.ndarray] = None,
         sample_weights: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Return adjacency matrix learned from *data*."""
+        """Return adjacency matrix learned from *data*.
+
+        ``max_parents`` may be a scalar (same cap for every variable) or an
+        array-like of length ``n_vars`` giving a per-variable cap — the latter
+        is how the Etxeberria automatic parent bound is threaded into the
+        ``k2_pen`` search.
+        """
         n_samples = data.shape[0]
-        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+        mp_arr = self._resolve_max_parents(n_vars, cardinality)
 
         perm_pos = _compute_perm_pos(n_vars, permutation)
         allowed = _build_allowed_parents(n_vars, perm_pos, interaction_matrix)
@@ -536,7 +631,7 @@ class GreedyHillClimbLearner:
             current_parents: List[int] = []
             current_score = scorer.local_score(var, current_parents, data, cardinality)
 
-            for _ in range(mp):
+            for _ in range(int(mp_arr[var])):
                 best_parent = -1
                 best_score = current_score
 
@@ -617,8 +712,22 @@ class StableHillClimbLearner:
         permutation: Optional[np.ndarray] = None,
         interaction_matrix: Optional[np.ndarray] = None,
         sample_weights: Optional[np.ndarray] = None,
+        initial_structure: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Return adjacency matrix learned from *data*."""
+        """Return adjacency matrix learned from *data*.
+
+        Parameters
+        ----------
+        initial_structure : np.ndarray of shape (n_vars, n_vars), optional
+            Warm-start adjacency (``initial_structure[u, v] == 1`` ⇒ edge
+            ``u → v``).  When given, the add/delete/reverse search starts from
+            this DAG instead of the empty graph — the mechanism the EBNA family
+            uses to warm-start each generation from the previous DAG.  The
+            matrix must be square, 0/1 and acyclic (``ValueError`` otherwise);
+            edges violating the permutation / interaction / ``max_parents``
+            constraints are silently dropped.  ``None`` (default) reproduces the
+            classic empty-graph start bit-for-bit.
+        """
         n_samples = data.shape[0]
         mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
 
@@ -638,8 +747,12 @@ class StableHillClimbLearner:
         def parents_of(var: int) -> List[int]:
             return list(np.where(adjacency[:, var] > 0)[0])
 
-        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        if initial_structure is None:
+            adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        else:
+            adjacency = _prepare_initial_structure(initial_structure, n_vars, allowed, mp)
 
+        n_iter = 0
         for _ in range(self.max_iter):
             best_key = None
             best_op: Optional[tuple] = None
@@ -708,7 +821,11 @@ class StableHillClimbLearner:
                 adjacency[v, u] = 1
             for key in [k for k in cache if k[0] in (u, v)]:
                 cache.pop(key, None)
+            n_iter += 1
 
+        # Number of accepted moves this run (used to verify that warm-starting
+        # converges in fewer iterations than an empty-graph start).
+        self.last_n_iter_ = n_iter
         return adjacency
 
 
@@ -769,8 +886,19 @@ class TabuHillClimbLearner:
         permutation: Optional[np.ndarray] = None,
         interaction_matrix: Optional[np.ndarray] = None,
         sample_weights: Optional[np.ndarray] = None,
+        initial_structure: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Return adjacency matrix learned from *data*."""
+        """Return adjacency matrix learned from *data*.
+
+        Parameters
+        ----------
+        initial_structure : np.ndarray of shape (n_vars, n_vars), optional
+            Warm-start adjacency (same semantics as
+            :meth:`StableHillClimbLearner.learn`): the tabu search begins from
+            this DAG instead of the empty graph.  Must be square, 0/1 and
+            acyclic; constraint-violating edges are dropped.  ``None`` (default)
+            reproduces the classic empty-graph start.
+        """
         n_samples = data.shape[0]
         mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
 
@@ -793,7 +921,10 @@ class TabuHillClimbLearner:
         def total_score() -> float:
             return sum(local(var, parents_of(var)) for var in range(n_vars))
 
-        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        if initial_structure is None:
+            adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        else:
+            adjacency = _prepare_initial_structure(initial_structure, n_vars, allowed, mp)
         tabu: List[tuple] = []
         # Track total score incrementally: BIC is decomposable, so the delta
         # returned by each operation is the exact change in total score.
@@ -1697,12 +1828,16 @@ class DecisionTreeLearner:
         limit_table_size: bool = True,
         alpha: float = 1.0,
         max_tree_depth: Optional[int] = None,
+        max_leaves: Optional[int] = None,
+        fast_local_scoring: bool = False,
     ) -> None:
         self.max_parents = max_parents
         self.max_iter = max_iter
         self.limit_table_size = limit_table_size
         self.alpha = alpha
         self.max_tree_depth = max_tree_depth
+        self.max_leaves = max_leaves
+        self.fast_local_scoring = fast_local_scoring
 
     def learn(
         self,
@@ -1714,12 +1849,18 @@ class DecisionTreeLearner:
         interaction_matrix: Optional[np.ndarray] = None,
         sample_weights: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        from bayes_nets.scoring import DecisionTreeMDLScorer
+        from bayes_nets.scoring import (
+            DecisionTreeMDLScorer,
+            FastDecisionTreeMDLScorer,
+        )
 
-        scoring = DecisionTreeMDLScorer(
+        scorer_cls = (FastDecisionTreeMDLScorer if self.fast_local_scoring
+                      else DecisionTreeMDLScorer)
+        scoring = scorer_cls(
             alpha=self.alpha,
             sample_weights=sample_weights,
             max_tree_depth=self.max_tree_depth,
+            max_leaves=self.max_leaves,
         )
         return StableHillClimbLearner(
             scoring=scoring,
@@ -1727,7 +1868,8 @@ class DecisionTreeLearner:
             max_iter=self.max_iter,
             limit_table_size=self.limit_table_size,
         ).learn(data, n_vars, cardinality,
-                permutation=permutation, interaction_matrix=interaction_matrix)
+                permutation=permutation, interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights)
 
 
 # ---------------------------------------------------------------------------
@@ -1783,12 +1925,18 @@ class DecisionGraphLearner:
         limit_table_size: bool = True,
         alpha: float = 1.0,
         max_tree_depth: Optional[int] = None,
+        max_leaves: Optional[int] = None,
+        split_score: str = "k2",
+        fast_local_scoring: bool = False,
     ) -> None:
         self.max_parents = max_parents
         self.max_iter = max_iter
         self.limit_table_size = limit_table_size
         self.alpha = alpha
         self.max_tree_depth = max_tree_depth
+        self.max_leaves = max_leaves
+        self.split_score = split_score
+        self.fast_local_scoring = fast_local_scoring
 
     def learn(
         self,
@@ -1800,12 +1948,19 @@ class DecisionGraphLearner:
         interaction_matrix: Optional[np.ndarray] = None,
         sample_weights: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        from bayes_nets.scoring import DecisionGraphBayesianScorer
+        from bayes_nets.scoring import (
+            DecisionGraphBayesianScorer,
+            FastDecisionGraphBayesianScorer,
+        )
 
-        scoring = DecisionGraphBayesianScorer(
+        scorer_cls = (FastDecisionGraphBayesianScorer if self.fast_local_scoring
+                      else DecisionGraphBayesianScorer)
+        scoring = scorer_cls(
             alpha=self.alpha,
             sample_weights=sample_weights,
             max_tree_depth=self.max_tree_depth,
+            max_leaves=self.max_leaves,
+            split_score=self.split_score,
         )
         return StableHillClimbLearner(
             scoring=scoring,
@@ -1813,7 +1968,194 @@ class DecisionGraphLearner:
             max_iter=self.max_iter,
             limit_table_size=self.limit_table_size,
         ).learn(data, n_vars, cardinality,
-                permutation=permutation, interaction_matrix=interaction_matrix)
+                permutation=permutation, interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights)
+
+
+# ---------------------------------------------------------------------------
+# Non-search decision-graph construction  (NDG / Tree-in-Tree, Zhu & Shoaran 2021)
+# ---------------------------------------------------------------------------
+
+
+def _ndg_grow_tree(
+    var: int,
+    candidates: List[int],
+    data: np.ndarray,
+    cardinality: np.ndarray,
+    w: np.ndarray,
+    alpha: float,
+    split_score: str,
+    max_parents: int,
+    max_depth: Optional[int],
+    max_leaves: Optional[int],
+) -> Dict[int, float]:
+    """Grow **one** decision tree for *var* over *candidates*; return split vars.
+
+    Greedy top-down growth using cached weighted joint histograms (the fast
+    sufficient-statistics recipe).  ``split_score`` selects the gain metric
+    (``"mdl"``/``"bic"`` cheaper BIC gain, ``"k2"`` Bayesian gain).  Growth
+    respects ``max_parents`` distinct split variables, ``max_depth`` and
+    ``max_leaves``.  Returns a mapping ``{split_var: best_gain}`` used both as
+    the parent set of *var* and to order edges when assembling the global DAG.
+    """
+    from bayes_nets.scoring import _dt_ll_rows, _k2_ll_rows, _weighted_joint_hist
+
+    k = int(cardinality[var])
+    alpha_k = alpha / k
+    var_vals = data[:, var]
+    n_total = float(w.sum())
+    use_k2 = (split_score == "k2")
+    used: Dict[int, float] = {}
+    budget = {"count": 1}
+
+    def base_score(idx: np.ndarray) -> float:
+        hist = np.bincount(var_vals[idx], weights=w[idx], minlength=k).astype(float).reshape(1, k)
+        rows = _k2_ll_rows(hist, alpha, alpha_k) if use_k2 else _dt_ll_rows(hist, alpha_k)
+        return float(rows.sum())
+
+    def build(idx: np.ndarray, avail: List[int], depth: int) -> None:
+        if (idx.size == 0 or not avail
+                or (max_depth is not None and depth >= max_depth)):
+            return
+        base = base_score(idx)
+        best_gain, best_p, best_cp = 0.0, -1, 0
+        for p in avail:
+            # Enforce the distinct-parent cap: a brand-new variable is only
+            # allowed while we are below max_parents.
+            if p not in used and len(used) >= max_parents:
+                continue
+            cp = int(cardinality[p])
+            if max_leaves is not None and budget["count"] + (cp - 1) > max_leaves:
+                continue
+            hist = _weighted_joint_hist(data[idx, p], var_vals[idx], w[idx], cp, k)
+            if use_k2:
+                gain = float(_k2_ll_rows(hist, alpha, alpha_k).sum()) - base
+            else:
+                children = float(_dt_ll_rows(hist, alpha_k).sum())
+                extra = (cp - 1) * (k - 1)
+                gain = children - base - extra * np.log(max(n_total, 1.0)) / 2.0
+            if gain > best_gain:
+                best_gain, best_p, best_cp = gain, p, cp
+
+        if best_p < 0:
+            return
+        used[best_p] = max(used.get(best_p, float("-inf")), best_gain)
+        budget["count"] += best_cp - 1
+        remaining = [q for q in avail if q != best_p]
+        pv = data[idx, best_p]
+        for val in range(best_cp):
+            build(idx[pv == val], remaining, depth + 1)
+
+    build(np.arange(data.shape[0]), list(candidates), 0)
+    return used
+
+
+class DecisionGraphNDGLearner:
+    """One-shot constructive decision-graph structure learner (NDG).
+
+    Unlike :class:`DecisionGraphLearner` (which drives
+    :class:`StableHillClimbLearner` and rebuilds a full decision graph for every
+    candidate move), this learner performs a **single** cheap pass: for each
+    variable it greedily grows *one* decision tree over the allowed candidate
+    parents and takes the split variables as that variable's parent set (the
+    Naive Decision Graph / Tree-in-Tree recipe; Zhu & Shoaran 2021).  The
+    per-variable directed edges are then assembled into a global DAG by adding
+    them in decreasing split-gain order, skipping any edge that would create a
+    cycle or exceed ``max_parents``.  Cost is roughly linear in the number of
+    tree nodes rather than combinatorial in candidate moves.
+
+    The compact, samplable CPDs are produced by the standard local-structure
+    parameter learner (``learn_local_structure(structure="dg")``) over the
+    returned adjacency, so ``method="dg_ndg", local_structure="dg"`` populates
+    ``bn.cpds`` with :class:`~bayes_nets.local_structure.LocalStructureCPD`
+    objects exactly like ``method="dg"``.
+
+    Parameters
+    ----------
+    max_parents : int or None
+        Maximum parents per variable.  ``None`` → rule of thumb.
+    alpha : float
+        Dirichlet/Laplace smoothing.
+    max_tree_depth : int or None
+        Maximum depth of each per-variable tree.
+    max_leaves : int or None
+        Maximum leaves of each per-variable tree.
+    split_score : {"mdl", "bic", "k2"}
+        Split-gain criterion (default ``"mdl"`` — the cheap linear-time choice).
+    seed : int or None
+        Reserved for reproducibility; the greedy construction is deterministic.
+
+    References
+    ----------
+    Zhu & Shoaran (2021). "Tree in Tree: from Decision Trees to Decision
+    Graphs." NeurIPS-2021.
+    """
+
+    def __init__(
+        self,
+        max_parents: Optional[int] = None,
+        alpha: float = 1.0,
+        max_tree_depth: Optional[int] = None,
+        max_leaves: Optional[int] = None,
+        split_score: str = "mdl",
+        seed: Optional[int] = None,
+    ) -> None:
+        self.max_parents = max_parents
+        self.alpha = alpha
+        self.max_tree_depth = max_tree_depth
+        self.max_leaves = max_leaves
+        self.split_score = (split_score or "mdl").lower()
+        if self.split_score not in ("mdl", "bic", "k2"):
+            raise ValueError("split_score must be 'mdl', 'bic', or 'k2'")
+        self.seed = seed
+
+    def learn(
+        self,
+        data: np.ndarray,
+        n_vars: int,
+        cardinality: np.ndarray,
+        *,
+        permutation: Optional[np.ndarray] = None,
+        interaction_matrix: Optional[np.ndarray] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        data = np.asarray(data, dtype=int)
+        n = data.shape[0]
+        mp = self.max_parents if self.max_parents is not None else _default_max_parents(cardinality)
+
+        perm_pos = _compute_perm_pos(n_vars, permutation)
+        allowed = _build_allowed_parents(n_vars, perm_pos, interaction_matrix)
+        perm_constrained = perm_pos is not None
+
+        if sample_weights is None:
+            w = np.ones(n, dtype=float)
+        else:
+            w = np.asarray(sample_weights, dtype=float) * n
+
+        # 1. Grow one tree per variable; collect candidate edges with their gain.
+        edges: List[Tuple[float, int, int]] = []
+        for v in range(n_vars):
+            cands = allowed[v]
+            if not cands:
+                continue
+            used = _ndg_grow_tree(
+                v, cands, data, cardinality, w, self.alpha, self.split_score,
+                mp, self.max_tree_depth, self.max_leaves,
+            )
+            for p, gain in used.items():
+                edges.append((float(gain), int(p), v))
+
+        # 2. Assemble a DAG: add edges by decreasing gain, cycle- and cap-safe.
+        # Deterministic tie-break by (parent, child) after the gain key.
+        edges.sort(key=lambda e: (e[0], -e[1], -e[2]), reverse=True)
+        adjacency = np.zeros((n_vars, n_vars), dtype=int)
+        for gain, p, v in edges:
+            if np.sum(adjacency[:, v]) >= mp:
+                continue
+            # Under a permutation the ordering already guarantees acyclicity.
+            if perm_constrained or not _would_create_cycle(adjacency, p, v):
+                adjacency[p, v] = 1
+        return adjacency
 
 
 # ---------------------------------------------------------------------------
@@ -3792,3 +4134,212 @@ class RFEK2Learner:
             interaction_matrix=interaction_matrix,
             sample_weights=sample_weights,
         )
+
+
+# ---------------------------------------------------------------------------
+# Priority-3 entry points (Part B of Fast_DG_Learning.md)
+#
+# These provide the *public interfaces* requested for the longer-term items;
+# they are intentionally lightweight, self-contained implementations that can
+# be extended later without changing their signatures.
+# ---------------------------------------------------------------------------
+
+
+class MarkovStructure:
+    """Result of :func:`learn_markov_structure`.
+
+    Attributes
+    ----------
+    adjacency : np.ndarray of shape (n_vars, n_vars)
+        Symmetric 0/1 undirected structure (the union of per-variable Markov
+        blankets estimated from the decision-tree splits).
+    features : list of list of tuple(int, int)
+        Conjunctive features, one list per non-trivial root-to-leaf path across
+        all per-variable trees.  Each feature is a list of ``(variable, value)``
+        literals whose conjunction defines the feature indicator.
+    """
+
+    __slots__ = ("adjacency", "features")
+
+    def __init__(self, adjacency: np.ndarray, features: List[List[Tuple[int, int]]]) -> None:
+        self.adjacency = adjacency
+        self.features = features
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return (f"MarkovStructure(n_vars={self.adjacency.shape[0]}, "
+                f"n_edges={int(self.adjacency.sum() // 2)}, "
+                f"n_features={len(self.features)})")
+
+
+def decision_tree_to_features(tree) -> List[List[Tuple[int, int]]]:
+    """Convert a decision-tree CPD into conjunctive features (Lowd & Davis 2014).
+
+    Each root-to-leaf path of the tree corresponds to a conjunction of
+    ``(variable, value)`` literals.  Given a
+    :class:`~bayes_nets.local_structure.LocalStructureCPD` (or its ``root``
+    node together with a ``parents`` list), return the list of such
+    conjunctions (the empty root leaf, i.e. an unconditioned CPD, yields no
+    feature).
+
+    Parameters
+    ----------
+    tree : LocalStructureCPD
+        A learned decision-tree / decision-graph CPD.
+
+    Returns
+    -------
+    list of list of (int, int)
+        One conjunction (list of literals) per non-root leaf path.
+    """
+    root = getattr(tree, "root", tree)
+    parents = getattr(tree, "parents", None)
+    features: List[List[Tuple[int, int]]] = []
+
+    def walk(node, path: List[Tuple[int, int]]) -> None:
+        if getattr(node, "is_leaf", node.split < 0):
+            if path:
+                features.append(list(path))
+            return
+        # node.split is the *position* in the parents list; map to the variable
+        # index when a parents list is available, else keep the position.
+        split_var = parents[node.split] if parents is not None else node.split
+        for value, child in enumerate(node.children):
+            walk(child, path + [(int(split_var), int(value))])
+
+    walk(root, [])
+    return features
+
+
+def learn_markov_structure(
+    data: np.ndarray,
+    cardinality: np.ndarray,
+    method: str = "dtsl",
+    *,
+    sample_weights: Optional[np.ndarray] = None,
+    max_parents: Optional[int] = None,
+    alpha: float = 1.0,
+    max_depth: Optional[int] = None,
+) -> "MarkovStructure":
+    """Learn an undirected (Markov-network) structure via DTSL.
+
+    DTSL (Decision-Tree Structure Learning; Lowd & Davis 2014) fits, for every
+    variable, a decision tree predicting it from the remaining variables; the
+    variables that appear as splits form that variable's Markov blanket, and the
+    root-to-leaf paths give conjunctive features for a log-linear model.  The
+    symmetrised union of the blankets is returned as an undirected structure,
+    together with the collected conjunctive features.
+
+    Parameters
+    ----------
+    data : np.ndarray, shape (n_samples, n_vars)
+    cardinality : np.ndarray, shape (n_vars,)
+    method : {"dtsl"}
+        Only ``"dtsl"`` is currently implemented.
+    sample_weights : array of float, optional
+        Probability vector over rows (sums to 1); honoured identically to the
+        rest of the library.
+    max_parents : int or None
+        Maximum number of split variables per per-variable tree.
+    alpha : float
+        Laplace/Dirichlet smoothing for the tree scorer.
+    max_depth : int or None
+        Maximum decision-tree depth.
+
+    Returns
+    -------
+    MarkovStructure
+
+    References
+    ----------
+    Lowd & Davis (2014). "Improving Markov Network Structure Learning Using
+    Decision Trees." JMLR.
+    """
+    if method.lower() != "dtsl":
+        raise ValueError("learn_markov_structure currently supports only method='dtsl'.")
+    from bayes_nets.local_structure import learn_local_cpd
+
+    data = np.asarray(data, dtype=int)
+    cardinality = np.asarray(cardinality, dtype=int)
+    n_vars = data.shape[1]
+    mp = max_parents if max_parents is not None else _default_max_parents(cardinality)
+
+    adjacency = np.zeros((n_vars, n_vars), dtype=int)
+    features: List[List[Tuple[int, int]]] = []
+    for v in range(n_vars):
+        parents = [u for u in range(n_vars) if u != v]
+        cpd = learn_local_cpd(
+            v, parents, data, cardinality, method="dt", alpha=alpha,
+            sample_weights=sample_weights, max_depth=max_depth, max_leaves=None,
+        )
+        # Which candidate parents actually appear as splits (the blanket).
+        used_positions = set()
+
+        def collect(node):
+            if node.is_leaf:
+                return
+            used_positions.add(node.split)
+            for ch in node.children:
+                collect(ch)
+
+        collect(cpd.root)
+        blanket = [parents[pos] for pos in used_positions]
+        # Respect the cap deterministically (keep lowest indices).
+        for u in sorted(blanket)[:mp]:
+            adjacency[u, v] = adjacency[v, u] = 1
+        features.extend(decision_tree_to_features(cpd))
+
+    return MarkovStructure(adjacency, features)
+
+
+def learn_graph_smoothness(
+    X: np.ndarray,
+    *,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+) -> np.ndarray:
+    """Learn a graph Laplacian from smooth signals (Dong et al. 2019).
+
+    Lightweight entry point for the signal-processing / GMRF path: given a data
+    matrix ``X`` whose columns are graph signals, return a graph Laplacian
+    ``L = D − W`` under the smoothness model of Dong et al. (2019).  The
+    non-negative, symmetric weight matrix ``W`` is obtained by soft-thresholding
+    the pairwise-distance-based affinities
+
+    ``W_ij ∝ max(0,  β − Z_ij / (2α))``  for ``i ≠ j``,
+
+    where ``Z_ij = ‖x_i − x_j‖²`` is the squared distance between node signals.
+    ``α`` controls the smoothness weight (larger → denser graph) and ``β`` the
+    sparsity offset.  This is a compact, dependency-free stand-in for the full
+    primal-dual solver and can be replaced without changing the signature.
+
+    Parameters
+    ----------
+    X : np.ndarray, shape (n_samples, n_vars)
+        Each **column** is a graph signal over the ``n_vars`` nodes.
+    alpha, beta : float
+        Smoothness and sparsity hyper-parameters (see above).
+
+    Returns
+    -------
+    np.ndarray, shape (n_vars, n_vars)
+        The learned graph Laplacian ``L = D − W``.
+
+    References
+    ----------
+    Dong, Thanou, Rabbat & Frossard (2019). "Learning Graphs from Data: A
+    Signal Representation Perspective." IEEE Signal Processing Magazine.
+    """
+    X = np.asarray(X, dtype=float)
+    n_vars = X.shape[1]
+    # squared distance between node signals (columns)
+    sq = np.sum(X ** 2, axis=0)
+    gram = X.T @ X
+    Z = sq[:, None] + sq[None, :] - 2.0 * gram
+    Z = np.maximum(Z, 0.0)
+    if alpha <= 0:
+        raise ValueError("alpha must be > 0")
+    W = np.maximum(0.0, beta - Z / (2.0 * alpha))
+    np.fill_diagonal(W, 0.0)
+    W = 0.5 * (W + W.T)  # enforce symmetry
+    L = np.diag(W.sum(axis=1)) - W
+    return L

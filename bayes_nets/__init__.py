@@ -11,8 +11,12 @@ from bayes_nets.scoring import (
     BICScoringMethod,
     AICScoringMethod,
     K2ScoringMethod,
+    K2PenScoringMethod,
+    etxeberria_max_parents,
     DecisionTreeMDLScorer,
     DecisionGraphBayesianScorer,
+    FastDecisionTreeMDLScorer,
+    FastDecisionGraphBayesianScorer,
 )
 from bayes_nets.structure_learning import (
     K2StructureLearner,
@@ -31,6 +35,7 @@ from bayes_nets.structure_learning import (
     StablePCLearner,
     DecisionTreeLearner,
     DecisionGraphLearner,
+    DecisionGraphNDGLearner,
     LevelWiseDPLearner,
     SARTREPruner,
     IterDSLALearner,
@@ -41,7 +46,11 @@ from bayes_nets.structure_learning import (
     RFEK2Learner,
     feature_importance_ordering,
     rfe_ordering,
+    learn_markov_structure,
+    decision_tree_to_features,
+    learn_graph_smoothness,
 )
+from bayes_nets.pdg import ProbabilisticDecisionGraph, bn_to_pdg
 from bayes_nets.polytree_learning import (
     ChowLiuTreeLearner,
     RebanePearlPolytreeLearner,
@@ -74,8 +83,12 @@ __all__ = [
     "BICScoringMethod",
     "AICScoringMethod",
     "K2ScoringMethod",
+    "K2PenScoringMethod",
+    "etxeberria_max_parents",
     "DecisionTreeMDLScorer",
     "DecisionGraphBayesianScorer",
+    "FastDecisionTreeMDLScorer",
+    "FastDecisionGraphBayesianScorer",
     "K2StructureLearner",
     "K2VariantLearner",
     "mi_variable_ordering",
@@ -92,6 +105,7 @@ __all__ = [
     "StablePCLearner",
     "DecisionTreeLearner",
     "DecisionGraphLearner",
+    "DecisionGraphNDGLearner",
     "LevelWiseDPLearner",
     "SARTREPruner",
     "IterDSLALearner",
@@ -102,6 +116,11 @@ __all__ = [
     "RFEK2Learner",
     "feature_importance_ordering",
     "rfe_ordering",
+    "learn_markov_structure",
+    "decision_tree_to_features",
+    "learn_graph_smoothness",
+    "ProbabilisticDecisionGraph",
+    "bn_to_pdg",
     "ChowLiuTreeLearner",
     "RebanePearlPolytreeLearner",
     "PolytreeLPALearner",
@@ -123,4 +142,4 @@ __all__ = [
     "ArithmeticCircuit",
 ]
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"

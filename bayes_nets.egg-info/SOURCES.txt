@@ -10,6 +10,7 @@ bayes_nets/inference.py
 bayes_nets/local_structure.py
 bayes_nets/notears.py
 bayes_nets/parameter_learning.py
+bayes_nets/pdg.py
 bayes_nets/polytree_learning.py
 bayes_nets/sampling.py
 bayes_nets/scoring.py
@@ -21,4 +22,5 @@ bayes_nets.egg-info/dependency_links.txt
 bayes_nets.egg-info/requires.txt
 bayes_nets.egg-info/top_level.txt
 tests/test_bayes_nets.py
+tests/test_dg_speedups.py
 tests/test_polytree_learning.py

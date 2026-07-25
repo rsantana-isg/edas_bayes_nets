@@ -136,6 +136,8 @@ class BayesianNetwork:
         interaction_matrix: Optional[np.ndarray] = None,
         sample_weights: Optional[np.ndarray] = None,
         local_structure: Optional[str] = None,
+        max_leaves: Optional[int] = None,
+        split_score: Optional[str] = None,
         **learn_kwargs,
     ) -> "BayesianNetwork":
         """Learn structure **and** parameters from *data*.
@@ -201,12 +203,15 @@ class BayesianNetwork:
             permutation=permutation,
             interaction_matrix=interaction_matrix,
             sample_weights=sample_weights,
+            max_leaves=max_leaves,
+            split_score=split_score,
             **learn_kwargs,
         )
         if local_structure is not None:
             self.learn_local_structure(
                 data, structure=local_structure, alpha=alpha,
                 sample_weights=sample_weights,
+                max_leaves=max_leaves, split_score=split_score,
             )
         else:
             self.learn_parameters(data, alpha=alpha, sample_weights=sample_weights)
@@ -229,11 +234,40 @@ class BayesianNetwork:
         seed: Optional[int] = None,
         fs_importance: str = "mutual_info",
         rfe_selector: str = "mrmr",
+        initial_structure: Optional[np.ndarray] = None,
+        candidate_parents=None,
+        fast_local_scoring: bool = False,
+        max_leaves: Optional[int] = None,
+        split_score: Optional[str] = None,
+        penalty="bic",
     ) -> "BayesianNetwork":
         """Learn the DAG structure from *data*.
 
         Resets any existing structure before learning.  See :meth:`fit`
         for full parameter documentation.
+
+        Extra keyword-only parameters (all no-ops at their defaults, so existing
+        callers are unaffected):
+
+        initial_structure : (n_vars, n_vars) 0/1 array, optional
+            Warm-start adjacency for ``method in {"stable_hc", "tabu"}`` — the
+            add/delete/reverse search begins from this DAG instead of the empty
+            graph (used by the EBNA family to warm-start each generation).
+            Ignored (with a warning) for methods that cannot use it.
+        candidate_parents : None or ``"mi:<k>"``
+            When ``"mi:<k>"``, restrict the parent search to each variable's
+            top-``k`` mutual-information neighbours (built with
+            :func:`~bayes_nets.mi_candidate_mask` and AND-ed with any supplied
+            ``interaction_matrix``).
+        fast_local_scoring : bool
+            For ``method in {"dt", "dg"}``, use the cached-statistics fast
+            scorers (identical scores, lower wall-clock).
+        max_leaves : int or None
+            Cap on the local-structure leaf count (``dt``/``dg``/``dg_ndg``).
+        split_score : {"mdl", "bic", "k2"} or None
+            Split-gain criterion for the ``dg``/``dg_ndg`` local structure.
+        penalty : {"bic", "aic"} or float
+            Complexity-penalty weight ``f(N)`` for ``method="k2_pen"``.
         """
         from bayes_nets.structure_learning import (
             K2StructureLearner,
@@ -243,6 +277,7 @@ class BayesianNetwork:
             GrowShrinkLearner,
             RecursiveCDLearner,
             RPCDLearner,
+            mi_candidate_mask,
         )
         from bayes_nets.scoring import BICScoringMethod, AICScoringMethod
 
@@ -254,6 +289,40 @@ class BayesianNetwork:
         )
 
         method = method.lower()
+
+        # Resolve candidate_parents="mi:<k>" into an interaction mask, AND-ed
+        # with any user-supplied interaction_matrix.
+        if candidate_parents is not None:
+            if isinstance(candidate_parents, str) and candidate_parents.startswith("mi:"):
+                try:
+                    top_k = int(candidate_parents.split(":", 1)[1])
+                except (ValueError, IndexError):
+                    raise ValueError(
+                        f"candidate_parents must be 'mi:<k>' with integer k; got "
+                        f"'{candidate_parents}'."
+                    )
+                mi_mask = mi_candidate_mask(
+                    data, self.n_vars, self.cardinality, top_k, sample_weights
+                )
+                if interaction_matrix is None:
+                    interaction_matrix = mi_mask
+                else:
+                    interaction_matrix = (
+                        (np.asarray(interaction_matrix) != 0).astype(int) & mi_mask
+                    )
+            else:
+                raise ValueError(
+                    "candidate_parents must be None or a string 'mi:<k>'."
+                )
+
+        # Warn when initial_structure is supplied to a method that ignores it.
+        if initial_structure is not None and method not in ("stable_hc", "tabu"):
+            import warnings
+            warnings.warn(
+                f"initial_structure is only used by methods 'stable_hc'/'tabu'; "
+                f"ignored for method '{method}'.",
+                stacklevel=2,
+            )
 
         learn_kwargs = dict(
             permutation=eff_perm,
@@ -311,6 +380,29 @@ class BayesianNetwork:
             learner = cls(
                 scoring=scoring,
                 max_parents=max_parents,
+                limit_table_size=limit_table_size,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+                initial_structure=initial_structure,
+            )
+
+        elif method in ("k2_pen", "ebna_k2"):
+            from bayes_nets.scoring import K2PenScoringMethod, etxeberria_max_parents
+            k2pen = K2PenScoringMethod(
+                alpha=alpha, sample_weights=sample_weights, penalty=penalty
+            )
+            # Etxeberria automatic per-variable parent bound when max_parents is
+            # left unspecified (the faithful EBNA_K2+pen behaviour).
+            mp_arg = max_parents
+            if mp_arg is None:
+                f_N = k2pen.f_penalty(data.shape[0])
+                mp_arg = etxeberria_max_parents(self.cardinality, data.shape[0], f_N)
+            learner = GreedyHillClimbLearner(
+                scoring=k2pen,
+                max_parents=mp_arg,
                 limit_table_size=limit_table_size,
             )
             self.adjacency = learner.learn(
@@ -394,6 +486,8 @@ class BayesianNetwork:
             learner = DecisionTreeLearner(
                 max_parents=max_parents,
                 alpha=alpha,
+                max_leaves=max_leaves,
+                fast_local_scoring=fast_local_scoring,
             )
             self.adjacency = learner.learn(
                 data, self.n_vars, self.cardinality,
@@ -407,6 +501,25 @@ class BayesianNetwork:
             learner = DecisionGraphLearner(
                 max_parents=max_parents,
                 alpha=alpha,
+                max_leaves=max_leaves,
+                split_score=(split_score or "k2"),
+                fast_local_scoring=fast_local_scoring,
+            )
+            self.adjacency = learner.learn(
+                data, self.n_vars, self.cardinality,
+                permutation=eff_perm,
+                interaction_matrix=interaction_matrix,
+                sample_weights=sample_weights,
+            )
+
+        elif method in ("dg_ndg", "ndg"):
+            from bayes_nets.structure_learning import DecisionGraphNDGLearner
+            learner = DecisionGraphNDGLearner(
+                max_parents=max_parents,
+                alpha=alpha,
+                max_leaves=max_leaves,
+                split_score=(split_score or "mdl"),
+                seed=seed,
             )
             self.adjacency = learner.learn(
                 data, self.n_vars, self.cardinality,
@@ -535,11 +648,11 @@ class BayesianNetwork:
         else:
             raise ValueError(
                 f"Unknown method '{method}'. "
-                "Choose 'bic', 'aic', 'k2', "
+                "Choose 'bic', 'aic', 'k2', 'k2_pen', "
                 "'k2_mi'/'k2_mb'/'k2_refine'/'k2_ensemble'/'k2_plus', "
                 "'stable_hc', 'tabu', "
                 "'gs', 'rcd', 'rpcd', 'pc', 'stable_pc', "
-                "'dt'/'decision_tree', 'dg'/'decision_graph', "
+                "'dt'/'decision_tree', 'dg'/'decision_graph', 'dg_ndg', "
                 "'dmbbn', 'levelwise'/'exact', 'sartre', "
                 "'iterdsla', 'binotears', 'bounded_tw', "
                 "'univ_bn', 'fi_k2', or 'rfe_k2'."
@@ -590,6 +703,8 @@ class BayesianNetwork:
         alpha: float = 1.0,
         max_depth: Optional[int] = None,
         sample_weights: Optional[np.ndarray] = None,
+        max_leaves: Optional[int] = None,
+        split_score: Optional[str] = None,
     ) -> "BayesianNetwork":
         """Fit decision-tree / decision-graph CPDs for the current structure.
 
@@ -627,7 +742,8 @@ class BayesianNetwork:
 
         data = np.asarray(data, dtype=int)
         learner = LocalStructureParameterLearner(
-            method=structure, alpha=alpha, max_depth=max_depth
+            method=structure, alpha=alpha, max_depth=max_depth,
+            max_leaves=max_leaves, split_score=split_score,
         )
         self.cpds = learner.learn(
             data, self.n_vars, self.cardinality, self.adjacency,

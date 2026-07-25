@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: bayes_nets
-Version: 0.1.0
+Version: 0.2.1
 Summary: Discrete Bayesian network learning, sampling, and visualization
 Author-email: Roberto Santana <roberto.santana@ehu.eus>
 License: MIT License
@@ -279,6 +279,35 @@ from bayes_nets import LogisticRegressionParameterLearner
 
 bn.learn_parameters(data, parameter_learner=LogisticRegressionParameterLearner(C=5.0))
 ```
+
+### Decision-tree / decision-graph local structure
+
+The CPDs can be represented with **local structure** instead of dense tables:
+a *decision tree* splits on the parents and stores a distribution only at the
+leaves (capturing context-specific independence), and a *decision graph* goes
+further by letting several leaves **share** a distribution (parameter tying).
+This composes with *any* base skeleton learner — the choice of structure
+learner and the CPD representation are decoupled — and the learned decision
+graphs are also exploited when sampling (parent configurations are routed to
+their leaf, never materialising the dense table). Following Friedman &
+Goldszmidt (1996) and Chickering, Heckerman & Meek (1997).
+
+```python
+# compose any structure learner (here SARTRE) with decision-graph CPDs
+bn.fit(data, method="sartre", local_structure="dg")
+
+# or add local structure to an already-learned / externally-set DAG
+bn.fit(data, method="k2")
+bn.learn_local_structure(data, structure="dt")   # "dt" tree or "dg" graph
+
+bn.n_parameters()      # counts the compact (distinct-leaf) parameters
+samples = bn.sample(100)   # sampled directly from the decision-graph CPDs
+```
+
+A node with many parents but a context-specific dependence keeps only a handful
+of parameters (e.g. 2 instead of 16 for a 4-parent node that depends on one
+parent). The building blocks are also public: `LocalStructureCPD`,
+`learn_local_cpd`, `LocalStructureParameterLearner`, `LocalStructureSampler`.
 
 ---
 

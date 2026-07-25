@@ -284,6 +284,8 @@ def learn_local_cpd(
     alpha: float = 1.0,
     sample_weights: Optional[np.ndarray] = None,
     max_depth: Optional[int] = None,
+    max_leaves: Optional[int] = None,
+    split_score: Optional[str] = None,
 ) -> LocalStructureCPD:
     """Learn a decision-tree (``method='dt'``) or decision-graph
     (``method='dg'``) CPD for *var* given its *parents*.
@@ -294,16 +296,40 @@ def learn_local_cpd(
     whenever pooling their statistics improves the total K2 score (parameter
     tying).  ``sample_weights`` is a probability vector over the rows (as
     elsewhere in the library); it is turned into effective counts.
+
+    Parameters
+    ----------
+    max_depth : int or None
+        Maximum tree depth.  ``None`` → grow until no split helps.
+    max_leaves : int or None
+        Cap on the number of tree leaves.  Splitting stops once the tree has
+        reached ``max_leaves`` leaves (in addition to ``max_depth`` and the
+        positive-gain stop).  ``max_leaves=1`` yields a single leaf (the
+        marginal CPD).  ``None`` (default) → unbounded (today's behaviour).
+    split_score : {"mdl", "bic", "k2"} or None
+        Split-gain criterion used to *grow* the structure.  ``"mdl"`` / ``"bic"``
+        use the BIC/MDL gain (cheaper); ``"k2"`` uses the K2 (Bayesian) gain.
+        ``None`` resolves to the method default: ``"mdl"`` for ``'dt'`` and
+        ``"k2"`` for ``'dg'``.  A decision graph grown with ``"mdl"`` still runs
+        the K2 leaf-merge step afterwards, giving a cheaper-to-grow DG
+        (Mühlenbein & Mahnig note the BDe/K2 split gain is the expensive part).
     """
     if method not in ("dt", "dg"):
         raise ValueError("method must be 'dt' (decision tree) or 'dg' (decision graph)")
-    if method == "dg" and alpha <= 0:
-        # The decision-graph gains and leaf merging use the K2
-        # (Dirichlet-Multinomial) marginal likelihood, which is undefined for a
-        # zero Dirichlet prior.  Fail clearly instead of degenerating silently.
-        raise ValueError("decision-graph CPDs ('dg') require alpha > 0 "
-                         "(the K2 score is undefined at alpha=0); use 'dt' for "
-                         "an MDL tree with no smoothing.")
+    # Resolve the split-gain criterion.
+    if split_score is None:
+        split_score = "k2" if method == "dg" else "mdl"
+    split_score = split_score.lower()
+    if split_score not in ("mdl", "bic", "k2"):
+        raise ValueError("split_score must be 'mdl', 'bic', or 'k2'")
+    use_k2 = (split_score == "k2")
+    if (method == "dg" or use_k2) and alpha <= 0:
+        # The decision-graph gains / leaf merging and the K2 split gain use the
+        # K2 (Dirichlet-Multinomial) marginal likelihood, which is undefined for
+        # a zero Dirichlet prior.  Fail clearly instead of degenerating silently.
+        raise ValueError("decision-graph CPDs ('dg') and split_score='k2' "
+                         "require alpha > 0 (the K2 score is undefined at "
+                         "alpha=0); use 'dt' with an MDL split for no smoothing.")
     data = np.asarray(data, dtype=int)
     n = data.shape[0]
     k = int(cardinality[var])
@@ -318,10 +344,12 @@ def learn_local_cpd(
         w = np.asarray(sample_weights, dtype=float) * n
     n_eff = float(w.sum())
     alpha_k = alpha / k
-    use_k2 = (method == "dg")
 
     # collected leaves: list of (node, counts, idx)
     leaves: List[Tuple[_Node, np.ndarray, np.ndarray]] = []
+    # Running leaf count for the max_leaves budget (the growing tree is a single
+    # leaf until the first accepted split).
+    leaf_budget = {"count": 1}
 
     def counts_of(idx: np.ndarray) -> np.ndarray:
         return _weighted_counts(var_col, idx, k, w)
@@ -342,6 +370,10 @@ def learn_local_cpd(
         best_gain, best_pos = 0.0, -1
         for pos in avail:
             cp = parent_card[pos]
+            # Respect the leaf budget: splitting on `pos` replaces this leaf
+            # with `cp` leaves (net +cp-1); skip splits that would overflow.
+            if max_leaves is not None and leaf_budget["count"] + (cp - 1) > max_leaves:
+                continue
             pv = parent_cols[idx, pos]
             child_score = 0.0
             for v in range(cp):
@@ -366,6 +398,7 @@ def learn_local_cpd(
             return leaf
 
         cp = parent_card[best_pos]
+        leaf_budget["count"] += cp - 1  # commit the extra leaves
         pv = parent_cols[idx, best_pos]
         remaining = [q for q in avail if q != best_pos]
         children = [build(idx[pv == v], remaining, depth + 1) for v in range(cp)]
@@ -452,13 +485,17 @@ class LocalStructureParameterLearner:
 
     def __init__(self, method: str = "dt", alpha: float = 1.0,
                  max_depth: Optional[int] = None,
-                 max_table_configs: int = 1 << 16) -> None:
+                 max_table_configs: int = 1 << 16,
+                 max_leaves: Optional[int] = None,
+                 split_score: Optional[str] = None) -> None:
         if method not in ("dt", "dg"):
             raise ValueError("method must be 'dt' (decision tree) or 'dg' (decision graph)")
         self.method = method
         self.alpha = alpha
         self.max_depth = max_depth
         self.max_table_configs = max_table_configs
+        self.max_leaves = max_leaves
+        self.split_score = split_score
 
     def learn(
         self,
@@ -476,7 +513,8 @@ class LocalStructureParameterLearner:
             local = learn_local_cpd(
                 var, parents, data, cardinality, method=self.method,
                 alpha=self.alpha, sample_weights=sample_weights,
-                max_depth=self.max_depth,
+                max_depth=self.max_depth, max_leaves=self.max_leaves,
+                split_score=self.split_score,
             )
             n_cfg = int(np.prod([int(cardinality[p]) for p in parents])) if parents else 1
             table = local.to_table() if n_cfg <= self.max_table_configs else None
